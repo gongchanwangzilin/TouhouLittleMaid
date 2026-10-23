@@ -302,6 +302,9 @@ public class EntityMaid extends TamableAnimal implements CrossbowAttackMob, IMai
     public int animationId = 0;
     public long animationRecordTime = -1L;
     public boolean shouldReset = false;
+    // WAB 主动触发的预设动画；只用于客户端表现，不写入存档
+    public String wabAnimation = "";
+    public long wabAnimationUntil = 0L;
 
     private List<SendEffectMessage.EffectData> effects = Lists.newArrayList();
     private IMaidTask task = TaskManager.getIdleTask();

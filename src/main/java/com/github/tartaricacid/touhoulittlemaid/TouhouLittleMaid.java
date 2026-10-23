@@ -2,6 +2,7 @@ package com.github.tartaricacid.touhoulittlemaid;
 
 import com.github.tartaricacid.touhoulittlemaid.api.ILittleMaid;
 import com.github.tartaricacid.touhoulittlemaid.compat.aquaculture.AquacultureCompat;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabConfig;
 import com.github.tartaricacid.touhoulittlemaid.config.GeneralConfig;
 import com.github.tartaricacid.touhoulittlemaid.config.ServerConfig;
 import com.github.tartaricacid.touhoulittlemaid.entity.info.CommonDefaultPack;
@@ -30,6 +31,7 @@ public final class TouhouLittleMaid {
         InitTrigger.init();
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, GeneralConfig.init());
         ModLoadingContext.get().registerConfig(ModConfig.Type.SERVER, ServerConfig.init());
+        ModLoadingContext.get().registerConfig(ModConfig.Type.SERVER, WabConfig.SPEC);
         CommonDefaultPack.initCommonDefaultPack();
         AquacultureCompat.init();
     }

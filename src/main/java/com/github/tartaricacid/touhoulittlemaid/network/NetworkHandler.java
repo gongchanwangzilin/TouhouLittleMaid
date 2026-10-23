@@ -145,6 +145,11 @@ public final class NetworkHandler {
                 Optional.of(NetworkDirection.PLAY_TO_SERVER));
         CHANNEL.registerMessage(58, SaveTTSSiteMessage.class, SaveTTSSiteMessage::encode, SaveTTSSiteMessage::decode, SaveTTSSiteMessage::handle,
                 Optional.of(NetworkDirection.PLAY_TO_SERVER));
+        CHANNEL.registerMessage(59, com.github.tartaricacid.touhoulittlemaid.compat.wab.WabAnimationMessage.class,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabAnimationMessage::encode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabAnimationMessage::decode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabAnimationMessage::handle,
+                Optional.of(NetworkDirection.PLAY_TO_CLIENT));
     }
 
     public static void sendToClientPlayer(Object message, Player player) {
