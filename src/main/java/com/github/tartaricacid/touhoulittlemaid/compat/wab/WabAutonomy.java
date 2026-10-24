@@ -1,5 +1,6 @@
 package com.github.tartaricacid.touhoulittlemaid.compat.wab;
 
+import com.github.tartaricacid.touhoulittlemaid.TouhouLittleMaid;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -8,6 +9,8 @@ import com.google.gson.JsonParser;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.level.Level;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -16,14 +19,17 @@ import java.util.UUID;
 
 /**
  * 游戏侧的日程与随机自发行为。
- * 日程（WabPlan）和自发的设置（WabAutonomy）都写进女仆的持久化数据，跟着存档走，
- * 不需要 WAB 每分钟都盯着；WAB 只在想要介入时用 `maid_plan` 改写或清空。
+ * 日程（WabPlan）和自发设置（WabAutonomy）都写进女仆的持久化数据，跟着存档走；
+ * 但只有 WAB 会话在的时候才执行——断开或换成上游模组，女仆就回到原本的样子。
  */
 public final class WabAutonomy {
     private final WabBridge bridge;
     private final Random random = new Random();
     private final Map<UUID, Map<String, Long>> lastStepRun = new HashMap<>();
     private final Map<UUID, Long> lastIdleAt = new HashMap<>();
+    private final Map<UUID, String> autonomyRaw = new HashMap<>();
+    private final Map<UUID, JsonObject> autonomyConf = new HashMap<>();
+    private final Map<UUID, Deque<Long>> idleMoments = new HashMap<>();
     private int tickCounter;
 
     public WabAutonomy(WabBridge bridge) {
@@ -31,11 +37,18 @@ public final class WabAutonomy {
     }
 
     public void notePlanChanged(EntityMaid maid) {
-        lastStepRun.remove(maid.getUUID());
+        UUID id = maid.getUUID();
+        lastStepRun.remove(id);
+        autonomyRaw.remove(id);
+        autonomyConf.remove(id);
+        idleMoments.remove(id);
     }
 
     public void tick() {
         if (!WabConfig.autonomyEnabled()) return;
+        // 没有 WAB 会话时女仆保持上游原样：日程和自发行动都等连上了再跑，
+        // 免得换了模组、没开 WAB 的玩家发现女仆自己在动。
+        if (!bridge.connected()) return;
         tickCounter++;
         if (tickCounter % 40 != 0) return;
         for (EntityMaid maid : bridge.ownedMaids()) {
@@ -83,6 +96,10 @@ public final class WabAutonomy {
 
     private void executeStep(EntityMaid maid, JsonObject step) {
         String doWhat = WabJson.str(step, "do").toLowerCase(Locale.ROOT);
+        if (!bridge.allowWorldActions() && WabGate.stepNeedsWorldActions(doWhat)) {
+            TouhouLittleMaid.LOGGER.debug("[WAB] 世界操作没有开放，跳过日程里的 {}", doWhat);
+            return;
+        }
         JsonObject params = new JsonObject();
         params.addProperty("maid", maid.getUUID().toString());
         switch (doWhat) {
@@ -122,37 +139,84 @@ public final class WabAutonomy {
 
     private void maybeIdle(EntityMaid maid) {
         if (bridge.dispatcher().hasJob(maid)) return;
+        JsonObject conf = autonomyOf(maid);
+        if (!WabJson.bool(conf, "enabled", true)) return;
+        long idleMillis = (long) (Math.max(1, WabJson.number(conf, "idleMinutes", 5)) * 60_000L);
         long now = System.currentTimeMillis();
         Long last = lastIdleAt.get(maid.getUUID());
-        if (last != null && now - last < 300000) return;
-        if (random.nextBoolean()) {
-            lastIdleAt.put(maid.getUUID(), now);
-            String action = switch (random.nextInt(4)) {
-                case 0 -> "wander";
-                case 1 -> "gesture";
-                case 2 -> "look";
-                default -> "home";
-            };
-            JsonObject params = new JsonObject();
-            params.addProperty("maid", maid.getUUID().toString());
-            switch (action) {
-                case "wander" -> WabActions.go(bridge, maid, params);
-                case "gesture" -> {
-                    params.addProperty("action", "gesture");
-                    params.addProperty("arg", random.nextBoolean() ? "wave" : "hug");
-                    WabActions.act(bridge, maid, params);
-                }
-                case "look" -> {
-                    params.addProperty("action", "look");
-                    WabActions.act(bridge, maid, params);
-                }
-                default -> WabActions.go(bridge, maid, params);
+        if (last != null && now - last < idleMillis) return;
+        if (!withinHourlyCap(maid, conf)) return;
+        if (!random.nextBoolean()) return;
+        lastIdleAt.put(maid.getUUID(), now);
+        idleMoments.computeIfAbsent(maid.getUUID(), k -> new ArrayDeque<>()).addLast(now);
+        String action = switch (random.nextInt(4)) {
+            case 0 -> "wander";
+            case 1 -> "gesture";
+            case 2 -> "look";
+            default -> "home";
+        };
+        JsonObject params = new JsonObject();
+        params.addProperty("maid", maid.getUUID().toString());
+        // go 的 mode 缺省会落到 "to"，而 "to" 解析不到目标时会把跟随挂到主人身上，
+        // 之后每 20 tick 重新寻路，把在家模式压掉——所以这里必须把意图显式带上。
+        params.addProperty("mode", action);
+        switch (action) {
+            case "wander" -> {
+                params.addProperty("radius", Math.max(1, WabJson.number(conf, "wanderRadius", 8.0)));
+                WabActions.go(bridge, maid, params);
+            }
+            case "gesture" -> {
+                params.addProperty("action", "gesture");
+                params.addProperty("arg", random.nextBoolean() ? "wave" : "hug");
+                WabActions.act(bridge, maid, params);
+            }
+            case "look" -> {
+                params.addProperty("action", "look");
+                WabActions.act(bridge, maid, params);
+            }
+            default -> WabActions.go(bridge, maid, params);
+        }
+    }
+
+    /**
+     * maid_plan 的 autonomy 段以前只写进存档、没人读，所以 idleMinutes /
+     * maxActionsPerHour / wanderRadius 三项设了也不生效；这里按原样接回来，缺省值维持旧行为。
+     */
+    private JsonObject autonomyOf(EntityMaid maid) {
+        String raw = maid.getPersistentData().getString("WabAutonomy");
+        UUID id = maid.getUUID();
+        JsonObject cached = autonomyConf.get(id);
+        if (cached != null && raw.equals(autonomyRaw.get(id))) return cached;
+        JsonObject conf = new JsonObject();
+        if (!raw.isEmpty()) {
+            try {
+                JsonElement parsed = JsonParser.parseString(raw);
+                if (parsed.isJsonObject()) conf = parsed.getAsJsonObject();
+            } catch (Exception ignored) {
             }
         }
+        autonomyRaw.put(id, raw);
+        autonomyConf.put(id, conf);
+        return conf;
+    }
+
+    /** 滚动一小时窗口内的自发次数；maxActionsPerHour 不填或填 0 表示不设上限。 */
+    private boolean withinHourlyCap(EntityMaid maid, JsonObject conf) {
+        int max = WabJson.integer(conf, "maxActionsPerHour", 0);
+        if (max <= 0) return true;
+        Deque<Long> window = idleMoments.computeIfAbsent(maid.getUUID(), k -> new ArrayDeque<>());
+        long now = System.currentTimeMillis();
+        while (!window.isEmpty() && now - window.peekFirst() > 3_600_000L) {
+            window.pollFirst();
+        }
+        return window.size() < max;
     }
 
     public void flush() {
         lastStepRun.clear();
         lastIdleAt.clear();
+        autonomyRaw.clear();
+        autonomyConf.clear();
+        idleMoments.clear();
     }
 }

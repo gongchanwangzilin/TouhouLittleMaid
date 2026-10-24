@@ -31,7 +31,7 @@ public final class TouhouLittleMaid {
         InitTrigger.init();
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, GeneralConfig.init());
         ModLoadingContext.get().registerConfig(ModConfig.Type.SERVER, ServerConfig.init());
-        ModLoadingContext.get().registerConfig(ModConfig.Type.SERVER, WabConfig.SPEC);
+        ModLoadingContext.get().registerConfig(ModConfig.Type.SERVER, WabConfig.SPEC, "touhou_little_maid-wab-server.toml");
         CommonDefaultPack.initCommonDefaultPack();
         AquacultureCompat.init();
     }

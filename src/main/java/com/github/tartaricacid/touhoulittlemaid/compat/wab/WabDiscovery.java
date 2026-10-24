@@ -21,7 +21,8 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * UDP 发现：向本机与局域网广播 beacon，收到带 HMAC 证明的 offer 后建立 TCP 会话。
+ * UDP 发现：默认只向本机发 beacon（局域网要 lanDiscovery 打开才发），
+ * 收到带 HMAC 证明的 offer 后建立 TCP 会话。
  * beacon 里的字段全部来自服务器线程维护的缓存，发现线程不直接碰实体。
  */
 public final class WabDiscovery {
@@ -122,6 +123,7 @@ public final class WabDiscovery {
         Set<InetAddress> targets = new LinkedHashSet<>();
         try {
             targets.add(InetAddress.getByName("127.0.0.1"));
+            if (!WabConfig.lanDiscovery()) return targets;
             targets.add(InetAddress.getByName("255.255.255.255"));
         } catch (Exception ignored) {
         }

@@ -201,10 +201,22 @@ public final class WabBridge {
     }
 
     void detach(WabSession expected) {
-        if (session == expected) {
-            session = null;
-            TouhouLittleMaid.LOGGER.info("[WAB] session closed, return to discovery");
-        }
+        if (session != expected) return;
+        session = null;
+        TouhouLittleMaid.LOGGER.info("[WAB] session closed, return to discovery");
+        // close() 可能是读线程、写线程或超时判定叫的，而下面要碰实体和 HashMap，必须挪回服务器线程。
+        // 断线不等于她会自动停下：跟随表还在的话每 20 tick 重新挤到主人身边，
+        // 采集任务会一路挖到 tick 预算用完——「WAB 没跑 = 上游行为」这条就不成立了。
+        server.execute(() -> {
+            dispatcher.cancelAll("WAB 断开了");
+            for (Map.Entry<UUID, UUID> entry : new HashMap<>(followTargets).entrySet()) {
+                EntityMaid maid = maids.get(entry.getKey());
+                if (maid == null) continue;
+                clearFollow(maid);
+                if (maid.isAlive()) maid.getNavigation().stop();
+            }
+            followTargets.clear();
+        });
     }
 
     void handleFrame(WabSession from, JsonObject frame) {
@@ -219,7 +231,13 @@ public final class WabBridge {
                 String id = WabJson.str(frame, "id");
                 String method = WabJson.str(frame, "method").toLowerCase(Locale.ROOT);
                 JsonObject params = WabJson.obj(frame, "params");
-                dispatcher.dispatch(from, id, method, params);
+                try {
+                    dispatcher.dispatch(from, id, method, params);
+                } catch (Exception e) {
+                    // 坏数据不该把服务器线程带进去：回一帧错误，调用方至少能立刻拿到结果。
+                    TouhouLittleMaid.LOGGER.warn("[WAB] command {} failed: {}", method, e.toString());
+                    from.sendResult(id, false, null, "internal_error", "游戏端执行这条命令时出了错。");
+                }
             }
             case "error" -> TouhouLittleMaid.LOGGER.warn("[WAB] WAB error {} {}",
                     WabJson.str(frame, "code"), WabJson.str(frame, "message"));
@@ -399,6 +417,10 @@ public final class WabBridge {
         return beaconMaids;
     }
 
+    /**
+     * 发现阶段的 beacon：只带配对必需的字段。世界名、玩家名和女仆名册放到 hello 里——
+     * 那时双方已经用 token/proof 对上，不至于每 3 秒朝整个局域网广播这些隐私。
+     */
     public JsonObject beacon(String nonce) {
         JsonObject out = new JsonObject();
         out.addProperty("magic", MAGIC);
@@ -409,9 +431,6 @@ public final class WabBridge {
         out.addProperty("mod", TouhouLittleMaid.MOD_ID);
         out.addProperty("modVersion", modVersion());
         out.addProperty("mc", "1.20.1");
-        out.addProperty("world", worldName);
-        out.addProperty("player", ownerName);
-        out.add("maids", beaconMaids);
         return out;
     }
 
@@ -419,6 +438,9 @@ public final class WabBridge {
         JsonObject out = beacon(nonce);
         out.addProperty("type", "hello");
         out.addProperty("token", token);
+        out.addProperty("world", worldName);
+        out.addProperty("player", ownerName);
+        out.add("maids", beaconMaids);
         return out.toString();
     }
 
@@ -560,6 +582,9 @@ public final class WabBridge {
     public static void onChat(ServerChatEvent event) {
         WabBridge bridge = instance;
         if (bridge == null || !bridge.connected()) return;
+        // 只转主人本人的话。女仆缓存是「首名玩家的」，别人靠近时把他的话吞掉，
+        // 多人服上等于凭空丢了条聊天。
+        if (bridge.owner == null || !event.getPlayer().getUUID().equals(bridge.owner.getUUID())) return;
         String text = event.getRawText().trim();
         if (text.isEmpty() || text.startsWith("/")) return;
         EntityMaid maid = bridge.nearestMaid(event.getPlayer(), WabConfig.chatRange());

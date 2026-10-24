@@ -62,16 +62,7 @@ public final class WabDispatcher {
                 from.sendResult(id, false, null, "maid_not_found", "找不到这个女仆。");
                 return;
             }
-            JsonObject result = WabActions.plan(bridge, maid, params);
-            if (result == null) {
-                from.sendResult(id, true, new JsonObject(), null, null);
-            } else {
-                boolean okResult = result.get("ok") != null && result.get("ok").getAsBoolean();
-                from.sendResult(id, okResult,
-                        result.get("data") != null ? result.getAsJsonObject("data") : null,
-                        result.get("code") != null ? result.get("code").getAsString() : null,
-                        result.get("error") != null ? result.get("error").getAsString() : null);
-            }
+            respond(from, id, WabActions.plan(bridge, maid, params));
             return;
         }
 
@@ -83,7 +74,7 @@ public final class WabDispatcher {
 
         if (method.equals("go") || method.equals("act") || method.equals("attack")
                 || method.equals("gather") || method.equals("hold")) {
-            if (!bridge.allowWorldActions() && method.equals("gather")) {
+            if (!bridge.allowWorldActions() && WabGate.commandNeedsWorldActions(method, params)) {
                 from.sendResult(id, false, null, "world_actions_disabled", "游戏端没有开放世界操作权限。");
                 return;
             }
@@ -92,38 +83,18 @@ public final class WabDispatcher {
                 return;
             }
             switch (method) {
-                case "go" -> {
-                    JsonObject result = WabActions.go(bridge, maid, params);
-                    if (result == null) from.sendResult(id, true, new JsonObject(), null, null);
-                    else from.sendResult(id, false, null, result.get("code").getAsString(),
-                            result.get("error").getAsString());
-                }
-                case "act" -> {
-                    JsonObject result = WabActions.act(bridge, maid, params);
-                    if (result == null) from.sendResult(id, true, new JsonObject(), null, null);
-                    else from.sendResult(id, false, null, result.get("code").getAsString(),
-                            result.get("error").getAsString());
-                }
-                case "attack" -> {
-                    JsonObject result = WabActions.attack(bridge, maid, params);
-                    if (result == null) from.sendResult(id, true, new JsonObject(), null, null);
-                    else from.sendResult(id, false, null, result.get("code").getAsString(),
-                            result.get("error").getAsString());
-                }
+                case "go" -> respond(from, id, WabActions.go(bridge, maid, params));
+                case "act" -> respond(from, id, WabActions.act(bridge, maid, params));
+                case "attack" -> respond(from, id, WabActions.attack(bridge, maid, params));
+                case "hold" -> respond(from, id, WabActions.hold(bridge, maid, params));
                 case "gather" -> {
                     String gatherAction = WabJson.str(params, "action").toLowerCase(Locale.ROOT);
                     if ("collect".equals(gatherAction)) {
-                        JsonObject result = WabActions.collect(bridge, maid, params);
-                        if (result == null) from.sendResult(id, true, new JsonObject(), null, null);
-                        else from.sendResult(id, false, null, result.get("code").getAsString(),
-                                result.get("error").getAsString());
+                        respond(from, id, WabActions.collect(bridge, maid, params));
                         return;
                     }
                     if ("fill".equals(gatherAction)) {
-                        JsonObject result = WabActions.fill(bridge, maid, params);
-                        if (result == null) from.sendResult(id, true, new JsonObject(), null, null);
-                        else from.sendResult(id, false, null, result.get("code").getAsString(),
-                                result.get("error").getAsString());
+                        respond(from, id, WabActions.fill(bridge, maid, params));
                         return;
                     }
                     cancelJob(maid, "被新的采集任务取代");
@@ -141,18 +112,30 @@ public final class WabDispatcher {
                     WabActions.Job job = WabActions.startGather(bridge, maid, params, 500, false, responder);
                     jobs.put(maid.getUUID(), job);
                 }
-                case "hold" -> {
-                    JsonObject result = WabActions.hold(bridge, maid, params);
-                    if (result == null) from.sendResult(id, true, new JsonObject(), null, null);
-                    else from.sendResult(id, false, null, result.get("code").getAsString(),
-                            result.get("error").getAsString());
-                }
                 default -> from.sendResult(id, false, null, "unknown_method", "不认识的方法：" + method);
             }
             return;
         }
 
         from.sendResult(id, false, null, "unknown_method", "不认识的方法：" + method);
+    }
+
+    /**
+     * 一次性动作的统一回执：null 表示「做完了，没有额外数据」；
+     * 带 ok=false 的按失败送出；其余整个对象当 data 原样送回——她那句「正在靠近 ××」就靠这条通道回到 AI 手里。
+     */
+    private void respond(WabSession from, String id, JsonObject result) {
+        if (result == null) {
+            from.sendResult(id, true, new JsonObject(), null, null);
+            return;
+        }
+        if (result.has("ok") && !WabJson.bool(result, "ok", true)) {
+            from.sendResult(id, false, null, WabJson.str(result, "code", "command_failed"),
+                    WabJson.str(result, "error", "命令没有成功。"));
+            return;
+        }
+        JsonObject data = WabJson.obj(result, "data");
+        from.sendResult(id, true, data.size() > 0 ? data : result, null, null);
     }
 
     public boolean hasJob(EntityMaid maid) {
@@ -170,12 +153,11 @@ public final class WabDispatcher {
     }
 
     public void cancelAll(String reason) {
-        for (java.util.UUID key : new java.util.ArrayList<>(jobs.keySet())) {
-            EntityMaid maid = bridge.ownedMaids().stream()
-                    .filter(m -> m.getUUID().equals(key)).findFirst().orElse(null);
-            if (maid != null) cancelJob(maid, reason);
-            jobs.remove(key);
+        for (WabActions.Job job : new java.util.ArrayList<>(jobs.values())) {
+            // 必须走 cancel：只有它会把任务压下去的 guiOpening 还原，不然她到停服都不会再动。
+            if (job != null) job.cancel(reason);
         }
+        jobs.clear();
     }
 
     public void tick() {

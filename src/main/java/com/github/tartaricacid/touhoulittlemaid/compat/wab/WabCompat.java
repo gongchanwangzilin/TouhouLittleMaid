@@ -6,6 +6,7 @@ import net.minecraft.server.level.ServerPlayer;
 import java.lang.reflect.Method;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * 对「车万女仆：爱憎分明（Love & Loathe）」的兼容层。
@@ -30,14 +31,27 @@ public final class WabCompat {
     private WabCompat() {
     }
 
+    /** 动画名会写进网络包（writeUtf 限 128），手势参数来自远端，先归一化再放行。 */
+    private static final int MAX_ANIMATION_LENGTH = 64;
+    private static final Pattern ANIMATION_CHARS = Pattern.compile("[^a-z0-9_.:\\-]");
+
     /**
      * 把一个抽象的手势名映射到 GeckoMaid 模型里真实存在的动画名。
-     * 认不出的名字原样透传，交给 GeckoLib 自己去查——查不到就安静地停在当前姿态，不会崩。
+     * 认不出的名字清洗后原样透传，交给 GeckoLib 自己去查——查不到就安静地停在当前姿态，不会崩。
      */
     public static String animationForGesture(String arg) {
-        if (arg == null || arg.isEmpty()) return "swing_hand";
-        String normalized = arg.toLowerCase(Locale.ROOT);
+        String normalized = sanitize(arg);
+        if (normalized.isEmpty()) return "swing_hand";
         return GESTURE_ALIASES.getOrDefault(normalized, normalized);
+    }
+
+    private static String sanitize(String raw) {
+        if (raw == null) return "";
+        String lower = raw.toLowerCase(Locale.ROOT).trim();
+        if (lower.length() > MAX_ANIMATION_LENGTH) {
+            lower = lower.substring(0, MAX_ANIMATION_LENGTH);
+        }
+        return ANIMATION_CHARS.matcher(lower).replaceAll("_");
     }
 
     /**

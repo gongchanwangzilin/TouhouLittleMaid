@@ -12,16 +12,19 @@ import java.io.OutputStreamWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 一条 WAB TCP 会话。读写都在独立线程/锁内完成；
  * 收到的业务帧交给服务器线程，避免任何实体操作跨线程。
+ * 写出同样是异步的：socket 的发送缓冲写满时阻塞的是写线程，服务器主循环不会陪着卡死。
  */
 public final class WabSession {
     private static final int MAX_LINE = 4 * 1024 * 1024;
     private static final int HEARTBEAT_MS = 10000;
     private static final int TIMEOUT_MS = 35000;
+    private static final int MAX_OUTBOX = 256;
 
     private final WabBridge bridge;
     private final Socket socket;
@@ -30,10 +33,12 @@ public final class WabSession {
     private final JsonObject welcome;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Object writeLock = new Object();
+    private final ArrayBlockingQueue<String> outbox = new ArrayBlockingQueue<>(MAX_OUTBOX);
     private final long openedAt = System.currentTimeMillis();
     private volatile long lastReadAt = System.currentTimeMillis();
     private volatile long lastPingAt = System.currentTimeMillis();
     private Thread readerThread;
+    private Thread writerThread;
 
     private WabSession(WabBridge bridge, Socket socket, BufferedReader reader, BufferedWriter writer, JsonObject welcome) {
         this.bridge = bridge;
@@ -84,10 +89,16 @@ public final class WabSession {
     }
 
     public void startReader() {
-        if (readerThread != null) return;
-        readerThread = new Thread(this::readLoop, "WAB-Session-Reader");
-        readerThread.setDaemon(true);
-        readerThread.start();
+        if (readerThread == null) {
+            readerThread = new Thread(this::readLoop, "WAB-Session-Reader");
+            readerThread.setDaemon(true);
+            readerThread.start();
+        }
+        if (writerThread == null) {
+            writerThread = new Thread(this::writeLoop, "WAB-Session-Writer");
+            writerThread.setDaemon(true);
+            writerThread.start();
+        }
         sendPing();
     }
 
@@ -147,17 +158,35 @@ public final class WabSession {
         send(ping);
     }
 
+    private void writeLoop() {
+        while (!closed.get()) {
+            String text;
+            try {
+                text = outbox.take();
+            } catch (InterruptedException e) {
+                return;
+            }
+            synchronized (writeLock) {
+                if (closed.get()) return;
+                try {
+                    writer.write(text);
+                    writer.newLine();
+                    writer.flush();
+                } catch (IOException e) {
+                    close("write failed");
+                    return;
+                }
+            }
+        }
+    }
+
     public void send(JsonObject message) {
         if (closed.get()) return;
-        String text = message.toString();
-        synchronized (writeLock) {
-            try {
-                writer.write(text);
-                writer.newLine();
-                writer.flush();
-            } catch (IOException e) {
-                close("write failed");
-            }
+        if (!outbox.offer(message.toString())) {
+            // 对端不收包时队列会满。此刻关掉会话（socket 一关，写线程立刻解开），
+            // 而不是让发起调用的服务器线程等 TCP 缓冲腾出来。
+            TouhouLittleMaid.LOGGER.warn("[WAB] write buffer full ({} frames), closing session", MAX_OUTBOX);
+            close("write buffer full");
         }
     }
 
@@ -178,9 +207,14 @@ public final class WabSession {
 
     public void close(String reason) {
         if (!closed.compareAndSet(false, true)) return;
+        outbox.clear();
         try {
             socket.close();
         } catch (IOException ignored) {
+        }
+        Thread writerCurrent = writerThread;
+        if (writerCurrent != null && writerCurrent != Thread.currentThread()) {
+            writerCurrent.interrupt();
         }
         bridge.detach(this);
         TouhouLittleMaid.LOGGER.info("[WAB] session closed after {} ms: {}", System.currentTimeMillis() - openedAt, reason);

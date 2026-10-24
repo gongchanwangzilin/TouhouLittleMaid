@@ -2,9 +2,11 @@ package com.github.tartaricacid.touhoulittlemaid.compat.wab;
 
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.tags.BlockTags;
@@ -17,6 +19,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraftforge.common.util.BlockSnapshot;
@@ -38,6 +41,11 @@ import java.util.Locale;
  * 由 <b>派发器</b> 每个 tick 驱动，避免卡死服务器线程。
  */
 public final class WabActions {
+    /** 远端传来的坐标是外部数据：走过去最远这么远，动手只在这个距离里认。 */
+    private static final double NAV_REACH = 128;
+    private static final double WORK_REACH = 24;
+    private static final double SIGHT_REACH = 64;
+
     private WabActions() {
     }
 
@@ -53,87 +61,76 @@ public final class WabActions {
         String mode = WabJson.str(p, "mode", "to").toLowerCase(Locale.ROOT);
         String targetName = WabJson.str(p, "target");
         double distance = WabJson.number(p, "distance", 2.0);
-        List<JsonArray> posList = new ArrayList<>();
         JsonArray posArr = WabJson.arr(p, "pos");
-        if (posArr.size() >= 3) {
-            posList.add(posArr);
-        }
 
-        switch (mode) {
+        return switch (mode) {
             case "to", "near" -> {
                 Entity target = resolveEntity(maid, targetName, targetName.isEmpty() ? bridge.currentOwner() : null);
-                if (target == null && posArr.size() >= 3) {
-                    double x = posArr.get(0).getAsDouble();
-                    double y = posArr.get(1).getAsDouble();
-                    double z = posArr.get(2).getAsDouble();
-                    double stopDistance = mode.equals("near") ? distance : 1.0;
-                    if (!navigateTo(maid, x, y, z, stopDistance)) {
-                        return fail("cannot_reach", "找不到可以走过去的路。");
+                BlockPos dest = remotePos(maid, posArr, NAV_REACH);
+                double stopDistance = mode.equals("near") ? distance : 1.0;
+                if (target == null && dest != null) {
+                    if (!navigateTo(maid, dest.getX() + 0.5, dest.getY(), dest.getZ() + 0.5, stopDistance)) {
+                        yield fail("cannot_reach", "找不到可以走过去的路。");
                     }
-                    ok(maid, "已出发送往 " + String.format("%.0f,%.0f,%.0f", x, y, z));
-                } else if (target != null) {
-                    double stopDistance = mode.equals("near") ? distance : 1.0;
+                    yield ok(maid, String.format("已出发送往 %.0f,%.0f,%.0f", dest.getX(), dest.getY(), dest.getZ()));
+                }
+                if (target != null) {
                     if (mode.equals("near")) {
                         if (!navigateTo(maid, target.getX(), target.getY(), target.getZ(), stopDistance)) {
-                            return fail("cannot_reach", "追不上目标了。");
+                            yield fail("cannot_reach", "追不上目标了。");
                         }
                     } else if (target instanceof ServerPlayer sp) {
                         bridge.setFollow(maid, sp);
                     } else {
                         navigateTo(maid, target.getX(), target.getY(), target.getZ(), 2.0);
                     }
-                    ok(maid, "正在靠近 " + target.getName().getString());
-                } else {
-                    return fail("invalid_target", "没有给出要靠近的目标。");
+                    yield ok(maid, "正在靠近 " + target.getName().getString());
                 }
+                if (!posArr.isEmpty() && dest == null) {
+                    yield fail("bad_pos", "那个坐标不在她能走到的范围里，或者区块还没加载。");
+                }
+                yield fail("invalid_target", "没有给出要靠近的目标。");
             }
             case "follow" -> {
                 Entity target = resolveEntity(maid, targetName.isEmpty() ? null : targetName, bridge.currentOwner());
-                if (target instanceof ServerPlayer sp) {
-                    bridge.setFollow(maid, sp);
-                    if (maid.distanceToSqr(sp) > 9) navigateTo(maid, sp.getX(), sp.getY(), sp.getZ(), 3.0);
-                    ok(maid, "现在开始跟着 " + sp.getName().getString());
-                } else {
-                    return fail("invalid_target", "只认得同维度的玩家，没法跟着别的生物。");
+                if (!(target instanceof ServerPlayer sp)) {
+                    yield fail("invalid_target", "只认得同维度的玩家，没法跟着别的生物。");
                 }
+                bridge.setFollow(maid, sp);
+                if (maid.distanceToSqr(sp) > 9) navigateTo(maid, sp.getX(), sp.getY(), sp.getZ(), 3.0);
+                yield ok(maid, "现在开始跟着 " + sp.getName().getString());
             }
             case "wait" -> {
                 bridge.clearFollow(maid);
                 maid.getNavigation().stop();
-                ok(maid, "停在原地等着。");
+                yield ok(maid, "停在原地等着。");
             }
             case "home" -> {
                 BlockPos home = maid.getSchedulePos().getNearestPos(maid);
                 if (home != null) {
                     navigateTo(maid, home.getX() + 0.5, home.getY(), home.getZ() + 0.5, 1.0);
-                    ok(maid, "回家。");
-                } else {
-                    ServerPlayer owner = bridge.currentOwner();
-                    if (owner != null && owner.level() == maid.level()) {
-                        navigateTo(maid, owner.getX(), owner.getY(), owner.getZ(), 2.0);
-                        ok(maid, "回到主人身边。");
-                    } else {
-                        return fail("no_home", "没有设置过家，也找不到主人。");
-                    }
+                    yield ok(maid, "回家。");
                 }
-                break;
+                ServerPlayer owner = bridge.currentOwner();
+                if (owner != null && owner.level() == maid.level()) {
+                    navigateTo(maid, owner.getX(), owner.getY(), owner.getZ(), 2.0);
+                    yield ok(maid, "回到主人身边。");
+                }
+                yield fail("no_home", "没有设置过家，也找不到主人。");
             }
             case "wander" -> {
-                double radius = WabJson.number(p, "radius", 8.0);
+                double radius = Math.max(1, Math.min(WORK_REACH, WabJson.number(p, "radius", 8.0)));
                 java.util.Random random = new java.util.Random();
                 double angle = random.nextDouble() * Math.PI * 2;
                 double x = maid.getX() + Math.cos(angle) * radius;
                 double z = maid.getZ() + Math.sin(angle) * radius;
                 if (!navigateTo(maid, x, maid.getY(), z, 1.0)) {
-                    return fail("cannot_reach", "那边去不了。");
+                    yield fail("cannot_reach", "那边去不了。");
                 }
-                ok(maid, "随便逛逛。");
+                yield ok(maid, "随便逛逛。");
             }
-            default -> {
-                return fail("unknown_mode", "不认识的移动方式：" + mode);
-            }
-        }
-        return null;
+            default -> fail("unknown_mode", "不认识的移动方式：" + mode);
+        };
     }
 
     private static boolean navigateTo(EntityMaid maid, double x, double y, double z, double stopDistance) {
@@ -173,8 +170,7 @@ public final class WabActions {
         }
         maid.swing(InteractionHand.MAIN_HAND);
         maid.doHurtTarget(target);
-        ok(maid, "对 " + target.getName().getString() + " 出手了。");
-        return null;
+        return ok(maid, "对 " + target.getName().getString() + " 出手了。");
     }
 
     private static Entity nearestLiving(EntityMaid maid, double radius) {
@@ -199,119 +195,121 @@ public final class WabActions {
     public static JsonObject act(WabBridge bridge, EntityMaid maid, JsonObject p) {
         String action = WabJson.str(p, "action").toLowerCase(Locale.ROOT);
         double duration = WabJson.number(p, "duration", 2.0);
-        int ticks = (int) Math.max(1, duration * 20);
-        switch (action) {
-            case "attack" -> {
-                return attack(bridge, maid, p);
-            }
+        int ticks = (int) Math.max(1, Math.min(60, duration) * 20);
+        return switch (action) {
+            case "attack" -> attack(bridge, maid, p);
             case "use" -> {
-                String targetName = WabJson.str(p, "target");
-                BlockPos pos = parsePos(WabJson.arr(p, "pos"));
-                Entity target = resolveEntity(maid, targetName, null);
+                JsonArray posArr = WabJson.arr(p, "pos");
+                BlockPos pos = remotePos(maid, posArr, WORK_REACH);
                 if (pos != null) {
-                    useBlock(maid, pos, p);
-                } else if (target != null) {
-                    maid.getLookControl().setLookAt(target, 30F, 30F);
-                    maid.swing(InteractionHand.MAIN_HAND);
-                    ok(maid, "朝着 " + target.getName().getString() + " 比划了一下。");
-                } else {
-                    return fail("no_target", "没有可用的使用目标。");
+                    yield ok(maid, useBlock(maid, pos, p));
                 }
-                return null;
+                if (!posArr.isEmpty()) {
+                    yield fail("bad_pos", "那个坐标太远、还没加载，或者不在她能碰到的范围里。");
+                }
+                Entity target = resolveEntity(maid, WabJson.str(p, "target"), null);
+                if (target == null) {
+                    yield fail("no_target", "没有可用的使用目标。");
+                }
+                maid.getLookControl().setLookAt(target, 30F, 30F);
+                maid.swing(InteractionHand.MAIN_HAND);
+                yield ok(maid, "朝着 " + target.getName().getString() + " 比划了一下。");
             }
             case "gesture" -> {
                 String arg = WabJson.str(p, "arg");
                 String animation = WabCompat.animationForGesture(arg.isEmpty() ? "wave" : arg);
-                WabAnimationMessage message = new WabAnimationMessage(maid.getId(), animation, ticks);
-                com.github.tartaricacid.touhoulittlemaid.network.NetworkHandler.sendToNearby(maid, message);
+                com.github.tartaricacid.touhoulittlemaid.network.NetworkHandler.sendToNearby(maid,
+                        new WabAnimationMessage(maid.getId(), animation, ticks));
                 if (arg.equals("sit")) maid.setInSittingPose(true);
                 if (arg.equals("stand")) maid.setInSittingPose(false);
-                ok(maid, "做了一个动作：" + arg);
-                return null;
+                yield ok(maid, "做了一个动作：" + animation);
             }
             case "say" -> {
                 String text = WabJson.str(p, "text");
                 if (!text.isEmpty() && maid.level() instanceof ServerLevel) {
                     maid.getChatBubbleManager().addLLMChatText(text, -1);
                 }
-                ok(maid, "说：「" + text + "」");
-                return null;
+                yield ok(maid, "说：「" + text + "」");
             }
             case "sit" -> {
                 maid.setInSittingPose(true);
                 maid.getNavigation().stop();
-                ok(maid, "坐下了。");
-                return null;
+                yield ok(maid, "坐下了。");
             }
             case "stand" -> {
                 maid.setInSittingPose(false);
-                ok(maid, "站了起来。");
-                return null;
+                yield ok(maid, "站了起来。");
             }
             case "sleep" -> {
-                BlockPos sleepPos = parsePos(WabJson.arr(p, "pos"));
-                if (sleepPos == null) {
-                    sleepPos = maid.getSchedulePos().getSleepPos();
-                }
-                if (sleepPos != null && maid.level().getBlockState(sleepPos).is(net.minecraft.tags.BlockTags.BEDS)) {
+                BlockPos sleepPos = remotePos(maid, WabJson.arr(p, "pos"), SIGHT_REACH);
+                if (sleepPos == null) sleepPos = maid.getSchedulePos().getSleepPos();
+                if (sleepPos != null && maid.level().isLoaded(sleepPos)
+                        && maid.level().getBlockState(sleepPos).is(BlockTags.BEDS)) {
                     maid.startSleeping(sleepPos);
-                    ok(maid, "上床睡觉了。");
-                } else {
-                    WabAnimationMessage message = new WabAnimationMessage(maid.getId(), "sleep", ticks);
-                    com.github.tartaricacid.touhoulittlemaid.network.NetworkHandler.sendToNearby(maid, message);
-                    ok(maid, "没有床，她只是闭眼休息了一会儿。");
+                    yield ok(maid, "上床睡觉了。");
                 }
-                return null;
+                com.github.tartaricacid.touhoulittlemaid.network.NetworkHandler.sendToNearby(maid,
+                        new WabAnimationMessage(maid.getId(), "sleep", ticks));
+                yield ok(maid, "没有床，她只是闭眼休息了一会儿。");
             }
             case "look" -> {
-                String targetName = WabJson.str(p, "target");
-                BlockPos pos = parsePos(WabJson.arr(p, "pos"));
-                Entity target = resolveEntity(maid, targetName, null);
+                JsonArray posArr = WabJson.arr(p, "pos");
+                BlockPos pos = remotePos(maid, posArr, SIGHT_REACH);
+                Entity target = resolveEntity(maid, WabJson.str(p, "target"), null);
                 if (target != null) {
                     maid.getLookControl().setLookAt(target, 30F, 30F);
                 } else if (pos != null) {
                     maid.getLookControl().setLookAt(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 30F, 30F);
+                } else if (!posArr.isEmpty()) {
+                    yield fail("bad_pos", "那个坐标太远或者区块还没加载。");
+                } else {
+                    yield fail("no_target", "没有可以看的对象。");
                 }
-                ok(maid, "看向那边。");
-                return null;
+                yield ok(maid, "看向那边。");
             }
-            case "interact_addon" -> {
-                String arg = WabJson.str(p, "arg");
-                String result = WabCompat.invokeAddonAction(bridge, maid, arg);
-                ok(maid, result);
-                return null;
-            }
-            default -> {
-                return fail("unknown_action", "不认识的动作：" + action);
-            }
-        }
+            case "interact_addon" -> ok(maid, WabCompat.invokeAddonAction(bridge, maid, WabJson.str(p, "arg")));
+            default -> fail("unknown_action", "不认识的动作：" + action);
+        };
     }
 
-    private static void useBlock(EntityMaid maid, BlockPos pos, JsonObject p) {
-        String targetName = WabJson.str(p, "target");
+    private static String useBlock(EntityMaid maid, BlockPos pos, JsonObject p) {
         String itemHint = WabJson.str(p, "item");
         ItemStack mainHand = maid.getMainHandItem();
         if (mainHand.getItem() instanceof BlockItem && (itemHint.isEmpty() || itemHint.equals("block"))) {
-            maid.placeItemBlock(pos, mainHand);
-        } else if (mainHand.is(Items.BUCKET) && isFluid(maid.level(), pos)) {
-            scoopFluid(maid, pos, mainHand);
-        } else {
-            maid.getLookControl().setLookAt(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 30F, 30F);
-            maid.swing(InteractionHand.MAIN_HAND);
+            return maid.placeItemBlock(pos, mainHand) ? "把方块放了上去。" : "那个位置放不进去。";
         }
+        if (mainHand.is(Items.BUCKET) && isFluid(maid.level(), pos)) {
+            return scoopFluid(maid, pos, mainHand)
+                    ? "舀起了一桶。"
+                    : "那儿的水她舀不走——流动的水面不是源方块。";
+        }
+        maid.getLookControl().setLookAt(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 30F, 30F);
+        maid.swing(InteractionHand.MAIN_HAND);
+        return "朝着那个方块比划了一下。";
     }
 
     private static boolean isFluid(Level level, BlockPos pos) {
         return !level.getFluidState(pos).isEmpty();
     }
 
-    private static void scoopFluid(EntityMaid maid, BlockPos pos, ItemStack bucket) {
-        ServerLevel level = (ServerLevel) maid.level();
+    /**
+     * 舀一桶水/岩浆。只认源方块，且走女仆原生采集任务的同一道 canDestroyBlock 判定，
+     * 这样保护类模组看到的行为和模组自己派活时一致。
+     */
+    private static boolean scoopFluid(EntityMaid maid, BlockPos pos, ItemStack bucket) {
+        if (!(maid.level() instanceof ServerLevel level)) return false;
         BlockState state = level.getBlockState(pos);
-        boolean lava = state.is(Blocks.LAVA);
-        ItemStack filled = new ItemStack(lava ? Items.LAVA_BUCKET : Items.WATER_BUCKET, bucket.getCount());
-        maid.setItemSlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND, filled);
-        level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+        if (!(state.is(Blocks.WATER) || state.is(Blocks.LAVA)) || !state.getFluidState().isSource()) return false;
+        if (!maid.canDestroyBlock(pos)) return false;
+        // 一桶换一桶：以前按 count 生成，16 只空桶能从一个源方块灌出 16 桶水。
+        bucket.shrink(1);
+        ItemStack filled = new ItemStack(state.is(Blocks.LAVA) ? Items.LAVA_BUCKET : Items.WATER_BUCKET);
+        ItemStack leftover = ItemHandlerHelper.insertItemStacked(maid.getAvailableInv(false), filled, false);
+        if (!leftover.isEmpty()) {
+            maid.level().addFreshEntity(new ItemEntity(maid.level(), maid.getX(), maid.getY(), maid.getZ(), leftover));
+        }
+        level.setBlock(pos, Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+        return true;
     }
 
     // ==================== 物品 ====================
@@ -321,98 +319,96 @@ public final class WabActions {
         int count = WabJson.integer(p, "count", 1);
         String item = WabJson.str(p, "item");
         String target = WabJson.str(p, "target");
-        switch (action) {
+        return switch (action) {
             case "give" -> {
                 ServerPlayer owner = bridge.currentOwner();
-                if (owner == null) return fail("no_owner", "主人不在线。");
+                if (owner == null) yield fail("no_owner", "主人不在线。");
                 if (owner.level() != maid.level() || owner.distanceToSqr(maid) > 8 * 8) {
                     if (owner.level() == maid.level()) navigateTo(maid, owner.getX(), owner.getY(), owner.getZ(), 2.0);
-                    return fail("too_far", "离得有点远，没法递过去。");
+                    yield fail("too_far", "离得有点远，没法递过去。");
                 }
                 ItemStack stack = takeFromMaid(maid, item, count);
-                if (stack.isEmpty()) {
-                    return fail("not_held", "手上没有要找的东西。");
-                }
+                if (stack.isEmpty()) yield fail("not_held", "手上没有要找的东西。");
+                int wanted = stack.getCount();
                 InvWrapper playerInv = new InvWrapper(owner.getInventory());
-                ItemStack leftover = ItemHandlerHelper.insertItemStacked(playerInv, stack, false);
-                int handed = stack.getCount() - leftover.getCount();
-                if (handed > 0 && !leftover.isEmpty()) {
-                    ItemEntity dropped = new ItemEntity(maid.level(), maid.getX(), maid.getY(), maid.getZ(), leftover);
-                    maid.level().addFreshEntity(dropped);
+                ItemStack remainder = ItemHandlerHelper.insertItemStacked(playerInv, stack, false);
+                // 主人包塞不下时剩下的必须落地，不能留在手里这个临时变量里蒸发掉。
+                if (!remainder.isEmpty()) {
+                    maid.level().addFreshEntity(new ItemEntity(maid.level(), maid.getX(), maid.getY(), maid.getZ(), remainder));
                 }
-                ok(maid, "递给了 " + owner.getName().getString() + "（" + Math.max(0, handed) + " 个）。");
-                return null;
+                yield ok(maid, "递给了 " + owner.getName().getString() + "（" + Math.max(0, wanted - remainder.getCount()) + " 个）。");
             }
             case "drop" -> {
                 ItemStack stack = takeFromMaid(maid, item, count);
-                if (stack.isEmpty()) {
-                    return fail("not_held", "手上没有要找的东西。");
-                }
+                if (stack.isEmpty()) yield fail("not_held", "手上没有要找的东西。");
                 ItemEntity dropped = new ItemEntity(maid.level(), maid.getX(), maid.getY(), maid.getZ(), stack);
                 maid.level().addFreshEntity(dropped);
-                ok(maid, "丢在了地上。");
-                return null;
+                yield ok(maid, "丢在了地上。");
             }
-            case "take" -> {
-                return collectNearby(maid, WabJson.str(p, "item"), count, WabJson.number(p, "radius", 8.0));
-            }
+            case "take" -> collectNearby(maid, WabJson.str(p, "item"), count, WabJson.number(p, "radius", 8.0));
             case "feed_player" -> {
                 ServerPlayer owner = bridge.currentOwner();
-                if (owner == null) return fail("no_owner", "主人不在线。");
+                if (owner == null) yield fail("no_owner", "主人不在线。");
                 if (owner.level() != maid.level() || owner.distanceToSqr(maid) > 4 * 4) {
                     if (owner.level() == maid.level()) navigateTo(maid, owner.getX(), owner.getY(), owner.getZ(), 2.0);
-                    return fail("too_far", "隔得太远，喂不到。");
+                    yield fail("too_far", "隔得太远，喂不到。");
                 }
                 ItemStack food = takeFromMaid(maid, item.isEmpty() ? "food" : item, 1);
                 if (food.isEmpty() || food.getItem().getFoodProperties(food, owner) == null) {
-                    return fail("no_food", "手上没有能喂的食物。");
+                    yield fail("no_food", "手上没有能喂的食物。");
                 }
                 if (food.getUseAnimation() == net.minecraft.world.item.UseAnim.DRINK) {
                     owner.level().playSound(null, owner, food.getDrinkingSound(),
                             net.minecraft.sounds.SoundSource.NEUTRAL, 0.5F, 0.9F);
                 }
                 food.getItem().finishUsingItem(food, owner.level(), owner);
-                WabAnimationMessage message = new WabAnimationMessage(maid.getId(), "use_mainhand", 40);
-                com.github.tartaricacid.touhoulittlemaid.network.NetworkHandler.sendToNearby(maid, message);
-                ok(maid, "直接把食物喂给了 " + owner.getName().getString() + "。");
-                return null;
+                com.github.tartaricacid.touhoulittlemaid.network.NetworkHandler.sendToNearby(maid,
+                        new WabAnimationMessage(maid.getId(), "use_mainhand", 40));
+                yield ok(maid, "直接把食物喂给了 " + owner.getName().getString() + "。");
             }
             case "place" -> {
-                BlockPos pos = parsePos(WabJson.arr(p, "pos"));
-                if (pos == null) return fail("no_pos", "没有给放置的位置。");
-                ItemStack stack = takeFromMaid(maid, item.isEmpty() ? "block" : item, 1);
-                if (stack.isEmpty()) return fail("not_held", "手上没有可放置的东西。");
-                if (stack.getItem() instanceof BlockItem && maid.placeItemBlock(pos, stack)) {
-                    ok(maid, "放了上去。");
-                } else {
-                    ok(maid, "不确定能不能放这儿。");
+                JsonArray posArr = WabJson.arr(p, "pos");
+                BlockPos pos = remotePos(maid, posArr, WORK_REACH);
+                if (pos == null) {
+                    yield posArr.isEmpty() ? fail("no_pos", "没有给放置的位置。")
+                            : fail("bad_pos", "那个位置她够不着，或者区块还没加载。");
                 }
-                return null;
+                ItemStack stack = takeFromMaid(maid, item.isEmpty() ? "block" : item, 1);
+                if (stack.isEmpty()) yield fail("not_held", "手上没有可放置的东西。");
+                yield ok(maid, stack.getItem() instanceof BlockItem && maid.placeItemBlock(pos, stack)
+                        ? "放了上去。" : "不确定能不能放这儿。");
             }
             case "equip" -> {
                 ItemStack stack = takeFromMaid(maid, item, 1);
-                if (stack.isEmpty()) return fail("not_held", "手上没有要找的东西。");
+                if (stack.isEmpty()) yield fail("not_held", "手上没有要找的东西。");
                 String slot = target.isEmpty() ? "mainhand" : target.toLowerCase(Locale.ROOT);
-                net.minecraft.world.entity.EquipmentSlot equipmentSlot;
-                switch (slot) {
-                    case "offhand" -> equipmentSlot = net.minecraft.world.entity.EquipmentSlot.OFFHAND;
-                    case "head" -> equipmentSlot = net.minecraft.world.entity.EquipmentSlot.HEAD;
-                    case "chest" -> equipmentSlot = net.minecraft.world.entity.EquipmentSlot.CHEST;
-                    case "legs" -> equipmentSlot = net.minecraft.world.entity.EquipmentSlot.LEGS;
-                    case "feet" -> equipmentSlot = net.minecraft.world.entity.EquipmentSlot.FEET;
-                    default -> equipmentSlot = net.minecraft.world.entity.EquipmentSlot.MAINHAND;
-                }
+                net.minecraft.world.entity.EquipmentSlot equipmentSlot = switch (slot) {
+                    case "offhand" -> net.minecraft.world.entity.EquipmentSlot.OFFHAND;
+                    case "head" -> net.minecraft.world.entity.EquipmentSlot.HEAD;
+                    case "chest" -> net.minecraft.world.entity.EquipmentSlot.CHEST;
+                    case "legs" -> net.minecraft.world.entity.EquipmentSlot.LEGS;
+                    case "feet" -> net.minecraft.world.entity.EquipmentSlot.FEET;
+                    default -> net.minecraft.world.entity.EquipmentSlot.MAINHAND;
+                };
+                ItemStack previous = maid.getItemBySlot(equipmentSlot);
                 maid.setItemSlot(equipmentSlot, stack);
-                ok(maid, "装备好了。");
-                return null;
+                // 原来那件装备不能凭空消失：先退回背包，塞不下就丢在脚边。
+                if (!previous.isEmpty()) {
+                    ItemStack orphan = ItemHandlerHelper.insertItemStacked(maid.getAvailableInv(false), previous, false);
+                    if (!orphan.isEmpty()) {
+                        maid.level().addFreshEntity(new ItemEntity(maid.level(), maid.getX(), maid.getY(), maid.getZ(), orphan));
+                    }
+                }
+                yield ok(maid, "装备好了，原来那件收回包里了。");
             }
-            default -> {
-                return fail("unknown_action", "不认识的动作：" + action);
-            }
-        }
+            default -> fail("unknown_action", "不认识的动作：" + action);
+        };
     }
 
     public static JsonObject collectNearby(EntityMaid maid, String item, int count, double radius) {
+        // 半径和数量都要夹：这条路径能被远端直接指定，不夹的话一次扫描能把整片区域的东西吸走。
+        radius = Math.max(1, Math.min(32, radius));
+        count = Math.max(1, Math.min(64, count));
         List<ItemEntity> picked = new ArrayList<>();
         double maxDistance = radius * radius;
         List<Entity> candidates = maid.level().getEntities(maid, maid.getBoundingBox().inflate(radius),
@@ -432,8 +428,7 @@ public final class WabActions {
         for (ItemEntity entity : picked) {
             if (maid.pickupItem(entity, false)) got++;
         }
-        ok(maid, "捡起了 " + got + " 件东西。");
-        return null;
+        return ok(maid, "捡起了 " + got + " 件东西。");
     }
 
     // ==================== 长时间任务（Job）====================
@@ -557,8 +552,7 @@ public final class WabActions {
                 }
                 case "scoop" -> {
                     ItemStack bucket = takeFromMaid(maid, "bucket", 1);
-                    if (!bucket.isEmpty()) {
-                        scoopFluid(maid, pos, bucket);
+                    if (!bucket.isEmpty() && scoopFluid(maid, pos, bucket)) {
                         got++;
                     }
                 }
@@ -683,7 +677,11 @@ public final class WabActions {
     }
 
     public static JsonObject fill(WabBridge bridge, EntityMaid maid, JsonObject params) {
-        BlockPos pos = parsePos(WabJson.arr(params, "pos"));
+        JsonArray posArr = WabJson.arr(params, "pos");
+        BlockPos pos = remotePos(maid, posArr, WORK_REACH);
+        if (pos == null && !posArr.isEmpty()) {
+            return fail("bad_pos", "那个位置她够不着，或者区块还没加载。");
+        }
         if (pos == null) {
             pos = maid.blockPosition().above();
         }
@@ -695,8 +693,7 @@ public final class WabActions {
             return fail("not_held", "手上没有可以填进去的方块。");
         }
         if (maid.placeItemBlock(pos, block)) {
-            ok(maid, "填上了。");
-            return null;
+            return ok(maid, "填上了。");
         }
         return fail("cannot_place", "放不上去，可能位置不对。");
     }
@@ -705,7 +702,7 @@ public final class WabActions {
 
     public static JsonObject plan(WabBridge bridge, EntityMaid maid, JsonObject params) {
         String action = WabJson.str(params, "action", "get").toLowerCase(Locale.ROOT);
-        switch (action) {
+        return switch (action) {
             case "get" -> {
                 JsonObject data = new JsonObject();
                 data.addProperty("plan", String.valueOf(maid.getScheduleDetail()));
@@ -713,28 +710,33 @@ public final class WabActions {
                 data.addProperty("work", String.valueOf(maid.getSchedulePos().getWorkPos()));
                 data.addProperty("idle", String.valueOf(maid.getSchedulePos().getIdlePos()));
                 data.addProperty("sleep", String.valueOf(maid.getSchedulePos().getSleepPos()));
-                return data;
+                data.addProperty("steps", maid.getPersistentData().getString("WabPlan"));
+                data.addProperty("autonomy", maid.getPersistentData().getString("WabAutonomy"));
+                yield data;
             }
             case "clear" -> {
-                ok(maid, "日程已清空。");
-                return null;
+                CompoundTag data = maid.getPersistentData();
+                // 以前这里只回了一句「已清空」，两行数据原封不动地留在存档里，
+                // 于是日程会一天一天继续跑，换回上游模组也带着它。
+                data.remove("WabPlan");
+                data.remove("WabAutonomy");
+                bridge.autonomy().notePlanChanged(maid);
+                yield ok(maid, "日程已经清掉了，她不会再自己按点行动。");
             }
             case "set" -> {
-                // 简化：记录到持久化数据里，交给 WabAutonomy 执行
-                String steps = WabJson.arr(params, "steps").toString();
-                maid.getPersistentData().putString("WabPlan", steps);
+                CompoundTag data = maid.getPersistentData();
+                data.putString("WabPlan", WabJson.arr(params, "steps").toString());
                 JsonObject autonomy = WabJson.obj(params, "autonomy");
                 if (autonomy.size() > 0) {
-                    maid.getPersistentData().putString("WabAutonomy", autonomy.toString());
+                    data.putString("WabAutonomy", autonomy.toString());
+                } else {
+                    data.remove("WabAutonomy");
                 }
                 bridge.autonomy().notePlanChanged(maid);
-                ok(maid, "日程写好了，她知道了今天要做什么。");
-                return null;
+                yield ok(maid, "日程写好了，她知道了今天要做什么。");
             }
-            default -> {
-                return fail("unknown_action", "不认识的日程操作。");
-            }
-    }
+            default -> fail("unknown_action", "不认识的日程操作。");
+        };
     }
 
     // ==================== 工具 ====================
@@ -771,16 +773,36 @@ public final class WabActions {
         return ItemStack.EMPTY;
     }
 
-    private static BlockPos parsePos(JsonArray arr) {
+    /**
+     * WAB 传来的坐标属于远端数据：必须能安全取值、区块已加载、在世界边界内、离她够近，
+     * 任一条件不满足就当没给，由调用方决定是回错误还是用她自己的位置。
+     */
+    private static BlockPos remotePos(EntityMaid maid, JsonArray arr, double maxDistance) {
         if (arr.size() < 3) return null;
+        double x = coord(arr, 0);
+        double y = coord(arr, 1);
+        double z = coord(arr, 2);
+        if (!Double.isFinite(x) || !Double.isFinite(y) || !Double.isFinite(z)) return null;
+        BlockPos pos = new BlockPos((int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z));
+        return reachable(maid, pos, maxDistance) ? pos : null;
+    }
+
+    private static double coord(JsonArray arr, int index) {
+        JsonElement element = arr.get(index);
+        if (element == null || !element.isJsonPrimitive()) return Double.NaN;
         try {
-            int x = arr.get(0).getAsInt();
-            int y = arr.get(1).getAsInt();
-            int z = arr.get(2).getAsInt();
-            return new BlockPos(x, y, z);
+            return element.getAsDouble();
         } catch (Exception e) {
-            return null;
+            return Double.NaN;
         }
+    }
+
+    private static boolean reachable(EntityMaid maid, BlockPos pos, double maxDistance) {
+        if (!(maid.level() instanceof ServerLevel level)) return false;
+        if (!level.isLoaded(pos)) return false;
+        if (pos.getY() < level.getMinBuildHeight() || pos.getY() > level.getMaxBuildHeight()) return false;
+        if (!level.getWorldBorder().isWithinBounds(pos)) return false;
+        return maid.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) <= maxDistance * maxDistance;
     }
 
     private static JsonObject fail(String code, String message) {
@@ -791,9 +813,11 @@ public final class WabActions {
         return out;
     }
 
-    private static void ok(EntityMaid maid, String message) {
-        JsonObject placeholder = new JsonObject();
-        placeholder.addProperty("maid", maid.getUUID().toString());
-        placeholder.addProperty("message", message);
+    /** 一次性动作的回执。以前这个对象造出来就丢了，AI 那边只收到空的 data、看不到她做了什么。 */
+    private static JsonObject ok(EntityMaid maid, String message) {
+        JsonObject out = new JsonObject();
+        out.addProperty("maid", maid.getUUID().toString());
+        out.addProperty("message", message);
+        return out;
     }
 }

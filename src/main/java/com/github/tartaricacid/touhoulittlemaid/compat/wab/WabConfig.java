@@ -13,6 +13,7 @@ public final class WabConfig {
     private static final ForgeConfigSpec.BooleanValue DEBUG;
     private static final ForgeConfigSpec.IntValue CHAT_RANGE;
     private static final ForgeConfigSpec.IntValue DISCOVERY_PORT;
+    private static final ForgeConfigSpec.BooleanValue LAN_DISCOVERY;
     private static final ForgeConfigSpec.IntValue BEACON_INTERVAL_SECONDS;
     private static final ForgeConfigSpec.BooleanValue AUTONOMY_ENABLED;
 
@@ -24,6 +25,8 @@ public final class WabConfig {
                 .define("enabled", true);
         DISCOVERY_PORT = builder.comment("UDP discovery port. Keep 27321 unless WAB is configured otherwise.")
                 .defineInRange("discoveryPort", 27321, 1, 65535);
+        LAN_DISCOVERY = builder.comment("Send the discovery beacon to LAN interfaces too. Leave false unless WAB runs on another machine; WAB's own lan setting must be on for the other side.")
+                .define("lanDiscovery", false);
         BEACON_INTERVAL_SECONDS = builder.comment("Beacon interval while disconnected.")
                 .defineInRange("beaconIntervalSeconds", 3, 1, 60);
         CHAT_RANGE = builder.comment("A plain chat line is sent to the nearest maid within this range.")
@@ -79,6 +82,11 @@ public final class WabConfig {
 
     public static int discoveryPort() {
         return integer(DISCOVERY_PORT, 27321);
+    }
+
+    /** 默认关：beacon 只发回环。WAB 的 lan 关着时它本来就收不到局域网包，广播出去纯属泄漏。 */
+    public static boolean lanDiscovery() {
+        return bool(LAN_DISCOVERY, false);
     }
 
     public static int beaconIntervalSeconds() {

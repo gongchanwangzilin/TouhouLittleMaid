@@ -27,8 +27,24 @@ public class WabAnimationMessage {
 
     public static void encode(WabAnimationMessage message, FriendlyByteBuf buf) {
         buf.writeInt(message.maidId);
-        buf.writeUtf(message.animation, 128);
+        buf.writeUtf(safe(message.animation), 128);
         buf.writeInt(message.durationTicks);
+    }
+
+    /**
+     * 动画名可能来自 WAB 传的手势参数。writeUtf(…, 128) 超长会直接抛，
+     * 落单的代理项也编码不了——这里兜一层，别让一个包把会话拖倒。
+     */
+    private static String safe(String raw) {
+        if (raw == null) return "idle";
+        StringBuilder sb = new StringBuilder(Math.min(raw.length(), 120));
+        for (int i = 0; i < raw.length() && sb.length() < 120; i++) {
+            char c = raw.charAt(i);
+            if (!Character.isSurrogate(c)) {
+                sb.append(c);
+            }
+        }
+        return sb.isEmpty() ? "idle" : sb.toString();
     }
 
     public static WabAnimationMessage decode(FriendlyByteBuf buf) {
