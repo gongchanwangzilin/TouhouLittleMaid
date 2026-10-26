@@ -49,6 +49,12 @@ import java.util.concurrent.ConcurrentHashMap;
 @Mod.EventBusSubscriber(modid = TouhouLittleMaid.MOD_ID, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public final class WabBridge {
     private static final String PROTOCOL = "1";
+    /**
+     * 桥自己的构建号。必须单独有：我们的 jar 顶替上游，modVersion 就得跟上游同号（1.5.3-forge+mc1.20.1），
+     * 否则宿主拿到的是「车万女仆的版本」，永远看不出用户装的桥是上个月那一份还是今天这一份。
+     * 加协议无关的新字段、新事件时 +0.1；改线上帧的语义才动 PROTOCOL。
+     */
+    private static final String BRIDGE_BUILD = "1.4.0";
     private static final String MAGIC = "WAB-MAID";
     private static WabBridge instance;
 
@@ -469,6 +475,7 @@ public final class WabBridge {
         out.addProperty("mc", SharedConstants.getCurrentVersion().getName());
         out.addProperty("loader", loaderName());
         out.addProperty("loaderVersion", loaderVersion());
+        out.addProperty("bridge", BRIDGE_BUILD);
         return out;
     }
 
