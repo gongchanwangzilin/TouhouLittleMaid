@@ -1,5 +1,8 @@
 package com.github.tartaricacid.touhoulittlemaid.network;
 
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabAnimationMessage;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoReply;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoRequest;
 import com.github.tartaricacid.touhoulittlemaid.network.message.*;
 import com.github.tartaricacid.touhoulittlemaid.network.message.ai.*;
 import net.minecraft.core.BlockPos;
@@ -80,6 +83,12 @@ public class NetworkHandler {
         registrar.playToClient(SyncAISitesPacket.TYPE, SyncAISitesPacket.STREAM_CODEC, SyncAISitesPacket::handle);
         registrar.playToServer(SaveLLMSitePacket.TYPE, SaveLLMSitePacket.STREAM_CODEC, SaveLLMSitePacket::handle);
         registrar.playToServer(SaveTTSSitePacket.TYPE, SaveTTSSitePacket.STREAM_CODEC, SaveTTSSitePacket::handle);
+
+        // WAB 桥三条：动作（服务器→周边客户端）、拍照请求（服务器→主人客户端）、拍照回执（客户端→服务器）。
+        // 桥上没配对时这三条路径一次都不会被走到，注册本身只是让包 ID 有个名字。
+        registrar.playToClient(WabAnimationMessage.TYPE, WabAnimationMessage.STREAM_CODEC, WabAnimationMessage::handle);
+        registrar.playToClient(WabPhotoRequest.TYPE, WabPhotoRequest.STREAM_CODEC, WabPhotoRequest::handle);
+        registrar.playToServer(WabPhotoReply.TYPE, WabPhotoReply.STREAM_CODEC, WabPhotoReply::handle);
     }
 
     public static void sendToClientPlayer(CustomPacketPayload payload, ServerPlayer player) {

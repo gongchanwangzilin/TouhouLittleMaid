@@ -1,0 +1,113 @@
+package com.github.tartaricacid.touhoulittlemaid.compat.wab;
+
+import net.neoforged.neoforge.common.ModConfigSpec;
+
+/**
+ * 模组侧配置。端口与允许的动作由 WAB 插件决定；这里只放“这台游戏愿不愿意参与”的开关。
+ */
+public final class WabConfig {
+    public static final ModConfigSpec SPEC;
+
+    private static final ModConfigSpec.BooleanValue ENABLED;
+    private static final ModConfigSpec.BooleanValue SHOW_HUD;
+    private static final ModConfigSpec.BooleanValue DEBUG;
+    private static final ModConfigSpec.IntValue CHAT_RANGE;
+    private static final ModConfigSpec.IntValue DISCOVERY_PORT;
+    private static final ModConfigSpec.BooleanValue LAN_DISCOVERY;
+    private static final ModConfigSpec.IntValue BEACON_INTERVAL_SECONDS;
+    private static final ModConfigSpec.BooleanValue AUTONOMY_ENABLED;
+    private static final ModConfigSpec.BooleanValue PLAYER_IN_MAID_BED;
+    private static final ModConfigSpec.IntValue MAID_CHAT_COOLDOWN;
+
+    static {
+        ModConfigSpec.Builder builder = new ModConfigSpec.Builder();
+        builder.comment("WarmAsBefore maid bridge. WAB controls a real maid body through this channel.");
+        builder.push("bridge");
+        ENABLED = builder.comment("Broadcast to WAB and accept its commands.")
+                .define("enabled", true);
+        DISCOVERY_PORT = builder.comment("UDP discovery port. Keep 27321 unless WAB is configured otherwise.")
+                .defineInRange("discoveryPort", 27321, 1, 65535);
+        LAN_DISCOVERY = builder.comment("Send the discovery beacon to LAN interfaces too. Leave false unless WAB runs on another machine; WAB's own lan setting must be on for the other side.")
+                .define("lanDiscovery", false);
+        BEACON_INTERVAL_SECONDS = builder.comment("Beacon interval while disconnected.")
+                .defineInRange("beaconIntervalSeconds", 3, 1, 60);
+        CHAT_RANGE = builder.comment("A plain chat line is sent to the nearest maid within this range.")
+                .defineInRange("chatRange", 8, 1, 64);
+        SHOW_HUD = builder.comment("Show WAB affection/trust on the action bar.")
+                .define("showHud", true);
+        AUTONOMY_ENABLED = builder.comment("Let scheduled and random autonomy run on the mod side.")
+                .define("autonomyEnabled", true);
+        PLAYER_IN_MAID_BED = builder.comment("Let the player sleep in a maid bed. Off by default: this changes what right-clicking a maid bed does, so it is opt-in only.")
+                .define("playerCanSleepInMaidBed", false);
+        MAID_CHAT_COOLDOWN = builder.comment("Minimum seconds between two maids reporting each other to WAB.")
+                .defineInRange("maidChatCooldownSeconds", 90, 10, 3600);
+        DEBUG = builder.comment("Log every bridge frame.")
+                .define("debug", false);
+        builder.pop();
+        SPEC = builder.build();
+    }
+
+    private WabConfig() {
+    }
+
+    private static boolean bool(ModConfigSpec.BooleanValue value, boolean fallback) {
+        try {
+            return value.get();
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private static int integer(ModConfigSpec.IntValue value, int fallback) {
+        try {
+            return value.get();
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    public static boolean enabled() {
+        return bool(ENABLED, true);
+    }
+
+    public static boolean showHud() {
+        return bool(SHOW_HUD, true);
+    }
+
+    public static boolean debug() {
+        return bool(DEBUG, false);
+    }
+
+    public static boolean autonomyEnabled() {
+        return bool(AUTONOMY_ENABLED, true);
+    }
+
+    public static int chatRange() {
+        return integer(CHAT_RANGE, 8);
+    }
+
+    public static int discoveryPort() {
+        return integer(DISCOVERY_PORT, 27321);
+    }
+
+    /** 默认关：beacon 只发回环。WAB 的 lan 关着时它本来就收不到局域网包，广播出去纯属泄漏。 */
+    public static boolean lanDiscovery() {
+        return bool(LAN_DISCOVERY, false);
+    }
+
+    public static int beaconIntervalSeconds() {
+        return integer(BEACON_INTERVAL_SECONDS, 3);
+    }
+
+    /**
+     * 玩家能不能睡女仆的床。默认关：开了之后右键女仆床的行为就变了，
+     * 而「换上我们的 jar、不连 WAB 也和原版一样」这条不变量得靠这个开关守住。
+     */
+    public static boolean playerCanSleepInMaidBed() {
+        return bool(PLAYER_IN_MAID_BED, false);
+    }
+
+    public static int maidChatCooldownSeconds() {
+        return integer(MAID_CHAT_COOLDOWN, 90);
+    }
+}
