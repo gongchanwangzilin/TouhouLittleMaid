@@ -26,7 +26,7 @@ public record WabAnimationMessage(int maidId, String animation, int durationTick
         buf.writeInt(message.maidId());
         ByteBufCodecs.STRING_UTF8.encode(buf, safe(message.animation()));
         buf.writeInt(message.durationTicks());
-    }, buf -> new WabAnimationMessage(buf.readInt(), buf.readUtf(128), buf.readInt()));
+    }, buf -> new WabAnimationMessage(buf.readInt(), ByteBufCodecs.STRING_UTF8.decode(buf), buf.readInt()));
 
     @Override
     public @NotNull Type<? extends CustomPacketPayload> type() {

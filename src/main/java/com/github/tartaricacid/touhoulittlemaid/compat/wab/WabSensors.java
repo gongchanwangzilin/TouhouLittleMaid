@@ -584,8 +584,11 @@ public final class WabSensors {
 
     private static JsonArray armor(EntityMaid maid) {
         JsonArray out = new JsonArray();
-        for (net.minecraft.world.entity.EquipmentSlot slot : net.minecraft.world.entity.EquipmentSlot.values()) {
-            if (slot.getType() != net.minecraft.world.entity.EquipmentSlot.Type.ARMOR) continue;
+        // 直接点这四个：1.21.1 把 EquipmentSlot.Type 的 ARMOR 拆成了人形/动物两种，
+        // 名字跟 1.20 不同；写死槽位既避开改名，也和「她身上穿的」这个语义一致。
+        for (net.minecraft.world.entity.EquipmentSlot slot : new net.minecraft.world.entity.EquipmentSlot[]{
+                net.minecraft.world.entity.EquipmentSlot.HEAD, net.minecraft.world.entity.EquipmentSlot.CHEST,
+                net.minecraft.world.entity.EquipmentSlot.LEGS, net.minecraft.world.entity.EquipmentSlot.FEET}) {
             ItemStack stack = maid.getItemBySlot(slot);
             if (stack.isEmpty()) continue;
             JsonObject item = item(stack);
