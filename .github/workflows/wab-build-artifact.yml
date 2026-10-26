@@ -77,15 +77,23 @@ jobs:
           name: wab-maid-bridge-jar-1.21
           path: run/mods
 
-      # 只留替换上游用的那一个 jar：-all 是影子包、-sources 是源码，带进服务端只会重复报错。
-      - name: Keep the plain mod jar only
+      # 1.21 的 build.gradle 把默认 jar 任务关了（jar { enabled = false }），
+      # 能装进服务端的只有 shadowJar 产出的 -all.jar——上游自己的发布流程也是取它。
+      # 所以这里反过来：留 -all，删源码包；万一哪天 -all 没了，才退回薄 jar。
+      - name: Keep the installable mod jar
         run: |
           cd run/mods
           ls -la
-          find . -name '*-all.jar' -delete
           find . -name '*-sources.jar' -delete
           find . -name '*-dev.jar' -delete
+          find . -name '*-deobf.jar' -delete
+          if ls ./*-all.jar >/dev/null 2>&1; then
+            find . -name '*.jar' ! -name '*-all.jar' -delete
+          else
+            find . -name '*-all.jar' -delete
+          fi
           ls -la
+          test "$(find . -name '*.jar' | wc -l)" = "1"
 
       - name: Download dependency mods from Modrinth
         run: python3 .github/script/download_modrinth_mod.py
