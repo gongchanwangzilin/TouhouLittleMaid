@@ -1,15 +1,18 @@
 package com.github.tartaricacid.touhoulittlemaid.compat.wab;
 
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import com.github.tartaricacid.touhoulittlemaid.init.InitBlocks;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
+import net.minecraft.util.Mth;
 import net.minecraft.world.Container;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
@@ -19,12 +22,18 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.CropBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BedPart;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.BooleanProperty;
+import net.minecraft.world.level.block.state.properties.EnumProperty;
 import net.minecraft.world.level.block.state.properties.IntegerProperty;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.registries.ForgeRegistries;
 
 import java.util.ArrayList;
@@ -38,6 +47,10 @@ import java.util.UUID;
  * 所有结果都是 JSON，方便直接放进 status / scan 的 result。
  */
 public final class WabSensors {
+    /** 床的两个属性。原版床和女仆床都用这一对，所以能一起读。 */
+    private static final EnumProperty<BedPart> PART = BlockStateProperties.BED_PART;
+    private static final BooleanProperty OCCUPIED = BlockStateProperties.OCCUPIED;
+
     private WabSensors() {
     }
 
@@ -145,10 +158,278 @@ public final class WabSensors {
             out.add("ores", blocks.get("ores"));
             out.add("containers", blocks.get("containers"));
             out.add("crops", blocks.get("crops"));
+            out.add("beds", blocks.get("beds"));
         }
         if (wantFluids) out.add("fluids", fluids(level, maid, radius));
         if (wantLight) out.add("light", light(level, maid));
         out.add("drops", itemEntities(maid, Math.min(radius, 12)));
+        return out;
+    }
+
+    /**
+     * 她「眼前」看到了什么：只报视线锥里、而且真的没有被方块挡住的東西，再拼成一段人话交给 AI。
+     * scan 是把周围一圈全摊开，这里回答的是另一件事——「她盯着的方向上有什么」。
+     * 半径和视角都钳过：这条能被远端点名调用，不钳的话一次查询能把整片区块扫穿。
+     */
+    public static JsonObject see(WabBridge bridge, EntityMaid maid, JsonObject params) {
+        int radius = Math.max(4, Math.min(48, WabJson.integer(params, "radius", 20)));
+        int cone = Math.max(20, Math.min(170, WabJson.integer(params, "cone", 70)));
+        ServerLevel level = (ServerLevel) maid.level();
+        Vec3 eye = maid.getEyePosition();
+        Vec3 forward = maid.getLookAngle().normalize();
+        double cosLimit = Math.cos(Math.toRadians(cone / 2.0));
+        String facing = facingName(maid.getDirection());
+
+        JsonArray targets = inFront(level, maid, eye, forward, radius, cosLimit);
+        JsonArray blocks = notableInCone(level, maid, eye, forward, cosLimit, Math.min(radius, 14));
+        JsonObject looksAt = rayHit(level, maid, eye, forward, radius);
+
+        JsonObject out = new JsonObject();
+        out.addProperty("maid", maid.getUUID().toString());
+        out.addProperty("facing", maid.getDirection().getName());
+        out.addProperty("facingText", facing);
+        out.addProperty("radius", radius);
+        out.addProperty("cone", cone);
+        out.add("eye", vec(eye));
+        out.add("world", world(bridge));
+        out.add("light", light(level, maid));
+        out.add("targets", targets);
+        out.add("blocks", blocks);
+        out.add("ground", blockAt(level, maid.blockPosition().below()));
+        if (looksAt != null) out.add("looksAt", looksAt);
+        out.addProperty("text", describe(facing, targets, blocks, looksAt, out));
+        return out;
+    }
+
+    /** 视线锥里的活物。先按点积筛方向，再做遮挡判定，最后按远近排——顺序不能反，点积最便宜。 */
+    private static JsonArray inFront(ServerLevel level, EntityMaid maid, Vec3 eye, Vec3 forward,
+                                     int radius, double cosLimit) {
+        List<Entity> candidates = new ArrayList<>(level.getEntities(maid, maid.getBoundingBox().inflate(radius),
+                entity -> entity != maid && entity.isAlive()));
+        candidates.sort(Comparator.comparingDouble(maid::distanceToSqr));
+        JsonArray out = new JsonArray();
+        for (Entity entity : candidates) {
+            if (out.size() >= 16) break;
+            Vec3 to = entity.getEyePosition().subtract(eye);
+            double distance = to.length();
+            if (distance < 0.4 || distance > radius) continue;
+            Vec3 dir = to.normalize();
+            if (dir.dot(forward) < cosLimit) continue;
+            if (!visible(level, eye, entity.getEyePosition())) continue;
+            JsonObject item = new JsonObject();
+            item.addProperty("name", entity.getName().getString());
+            item.addProperty("type", entityType(entity));
+            item.addProperty("kind", kind(entity));
+            item.addProperty("distance", round(distance));
+            item.addProperty("side", sideLabel(forward, dir));
+            item.addProperty("height", dir.y > 0.28 ? "在上方" : dir.y < -0.28 ? "在下方" : "平视");
+            item.add("pos", vecPos(entity));
+            if (entity instanceof LivingEntity living) {
+                item.addProperty("health", round(living.getHealth()));
+            }
+            if (entity instanceof Player player) {
+                item.addProperty("player", player.getGameProfile().getName());
+            }
+            out.add(item);
+        }
+        return out;
+    }
+
+    /** 锥里有用的方块（矿石/容器/成熟作物）。这一层不做遮挡——「那块铁矿在墙后面」对她规划路线同样是信息。 */
+    private static JsonArray notableInCone(ServerLevel level, EntityMaid maid, Vec3 eye, Vec3 forward,
+                                           double cosLimit, int radius) {
+        JsonArray out = new JsonArray();
+        BlockPos origin = maid.blockPosition();
+        List<FoundBlock> found = new ArrayList<>();
+        for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-radius, -radius, -radius),
+                origin.offset(radius, radius, radius))) {
+            if (pos.distSqr(origin) > (double) radius * radius) continue;
+            BlockState state = level.getBlockState(pos);
+            if (state.isAir()) continue;
+            boolean ore = isOre(state);
+            boolean container = state.hasBlockEntity() && level.getBlockEntity(pos) instanceof Container;
+            boolean crop = isMatureCrop(state);
+            boolean bed = isBedLike(state) && state.hasProperty(PART) && state.getValue(PART) == BedPart.HEAD;
+            if (!ore && !container && !crop && !bed) continue;
+            Vec3 to = new Vec3(pos.getX() + 0.5 - eye.x, pos.getY() + 0.5 - eye.y, pos.getZ() + 0.5 - eye.z);
+            double distance = to.length();
+            if (distance < 0.4 || distance > radius) continue;
+            Vec3 dir = to.normalize();
+            if (dir.dot(forward) < cosLimit) continue;
+            found.add(new FoundBlock(pos.immutable(), distance, ore, container, crop, bed));
+        }
+        found.sort(Comparator.comparingDouble(FoundBlock::distance));
+        for (FoundBlock block : found) {
+            if (out.size() >= 24) break;
+            JsonObject item = blockJson(block.pos, maid);
+            item.addProperty("block", blockId(level, block.pos));
+            item.addProperty("what", block.ore ? "矿" : block.container ? "容器" : block.bed ? "床" : "作物");
+            if (block.bed) {
+                BlockState state = level.getBlockState(block.pos);
+                item.addProperty("for", isMaidBed(state) ? "maid" : "vanilla");
+                item.addProperty("occupied", state.hasProperty(OCCUPIED) && state.getValue(OCCUPIED));
+            }
+            out.add(item);
+        }
+        return out;
+    }
+
+    /** 她正看着哪儿：沿视线步进，撞上第一个实心方块就停。 */
+    private static JsonObject rayHit(ServerLevel level, EntityMaid maid, Vec3 eye, Vec3 forward, int radius) {
+        for (double d = 0.5; d <= radius; d += 0.4) {
+            Vec3 at = eye.add(forward.scale(d));
+            BlockPos pos = new BlockPos(Mth.floor(at.x), Mth.floor(at.y), Mth.floor(at.z));
+            if (!level.isLoaded(pos)) return null;
+            if (!level.getFluidState(pos).isEmpty()) {
+                JsonObject hit = blockJson(pos, maid);
+                hit.addProperty("fluid", level.getFluidState(pos).is(FluidTags.LAVA) ? "lava" : "water");
+                hit.addProperty("at", round(d));
+                return hit;
+            }
+            BlockState state = level.getBlockState(pos);
+            if (state.isAir()) continue;
+            // 玻璃、栅栏、台阶这类不遮视线的方块不算「撞上」——她透过它们看见的东西才是她想说的。
+            if (!state.canOcclude() && !state.hasBlockEntity()) continue;
+            JsonObject hit = blockJson(pos, maid);
+            hit.addProperty("block", blockId(level, pos));
+            hit.addProperty("at", round(d));
+            return hit;
+        }
+        return null;
+    }
+
+    /**
+     * 遮挡判定用采样，不用 level.clip：Ray / ClipResult 这几个版本挪过家，
+     * 采样只依赖 isAir 和 canOcclude 两个一直没变的口子。
+     */
+    private static boolean visible(ServerLevel level, Vec3 from, Vec3 to) {
+        double distance = from.distanceTo(to);
+        int steps = (int) Math.max(2, Math.min(160, distance * 3));
+        Vec3 delta = to.subtract(from).scale(1.0 / steps);
+        double x = from.x + delta.x * 0.6;
+        double y = from.y + delta.y * 0.6;
+        double z = from.z + delta.z * 0.6;
+        for (int i = 0; i < steps; i++) {
+            BlockPos pos = new BlockPos(Mth.floor(x), Mth.floor(y), Mth.floor(z));
+            if (!level.isLoaded(pos)) return false;
+            if (level.getBlockState(pos).canOcclude()) return false;
+            x += delta.x;
+            y += delta.y;
+            z += delta.z;
+        }
+        return true;
+    }
+
+    private static String describe(String facing, JsonArray targets, JsonArray blocks,
+                                   JsonObject looksAt, JsonObject out) {
+        StringBuilder sb = new StringBuilder();
+        JsonObject world = WabJson.obj(out, "world");
+        sb.append("她面朝").append(facing).append("，此刻 ").append(WabJson.str(world, "time", "?"))
+                .append("，").append(weatherName(WabJson.str(world, "weather", "clear"))).append("。");
+        if (targets.size() == 0) {
+            sb.append("眼前没有活物。");
+        } else {
+            sb.append("眼前有 ").append(targets.size()).append(" 个：");
+            for (int i = 0; i < targets.size(); i++) {
+                JsonObject item = targets.get(i).getAsJsonObject();
+                if (i > 0) sb.append("，");
+                sb.append(nameOf(item)).append("在").append(WabJson.str(item, "side", "正前方"))
+                        .append(roundText(WabJson.number(item, "distance", 0))).append(" 格");
+            }
+            sb.append("。");
+        }
+        if (looksAt != null) {
+            if (looksAt.has("fluid")) {
+                sb.append("她正对着一片").append(WabJson.str(looksAt, "fluid").equals("lava") ? "岩浆" : "水")
+                        .append("，离她 ").append(roundText(WabJson.number(looksAt, "at", 0))).append(" 格。");
+            } else {
+                sb.append("视线尽头是一格 ").append(shortId(WabJson.str(looksAt, "block", "方块")))
+                        .append("，离她 ").append(roundText(WabJson.number(looksAt, "at", 0))).append(" 格。");
+            }
+        } else {
+            sb.append("视线尽头没有挡住她的东西。");
+        }
+        if (blocks.size() > 0) {
+            sb.append("视野里还能看出：");
+            int shown = Math.min(blocks.size(), 8);
+            for (int i = 0; i < shown; i++) {
+                JsonObject item = blocks.get(i).getAsJsonObject();
+                if (i > 0) sb.append("、");
+                sb.append(WabJson.str(item, "what", "方块")).append(" ").append(shortId(WabJson.str(item, "block", "?")));
+                if (item.has("for")) {
+                    sb.append(WabJson.str(item, "for").equals("maid") ? "（她的床）" : "（普通床）");
+                }
+                sb.append("，").append(roundText(WabJson.number(item, "distance", 0))).append(" 格");
+            }
+            if (blocks.size() > shown) sb.append("，一共 ").append(blocks.size()).append(" 处");
+            sb.append("。");
+        }
+        return sb.length() > 700 ? sb.substring(0, 700) : sb.toString();
+    }
+
+    private static String nameOf(JsonObject item) {
+        String kind = WabJson.str(item, "kind", "");
+        String name = WabJson.str(item, "name", "东西");
+        if (kind.equals("player")) return "玩家 " + name;
+        if (kind.equals("maid")) return "女仆 " + name;
+        if (kind.equals("hostile")) return name;
+        return name;
+    }
+
+    private static String weatherName(String weather) {
+        return switch (weather) {
+            case "rain" -> "下着雨";
+            case "thunder" -> "雷雨交加";
+            default -> "天气晴";
+        };
+    }
+
+    private static String roundText(double value) {
+        return String.format(Locale.ROOT, "%.1f", value);
+    }
+
+    /** minecraft:iron_ore → 铁矿石之外的裸 id 太长了，AI 读起来费眼；只留路径段。 */
+    private static String shortId(String id) {
+        int i = id.lastIndexOf(':');
+        String bare = i >= 0 ? id.substring(i + 1) : id;
+        return bare.isEmpty() ? "方块" : bare;
+    }
+
+    private static String facingName(Direction direction) {
+        return switch (direction) {
+            case NORTH -> "北";
+            case SOUTH -> "南";
+            case EAST -> "东";
+            case WEST -> "西";
+            case UP -> "上";
+            case DOWN -> "下";
+        };
+    }
+
+    /** 绕 Y 的叉积分量：正=在她右手边，负=左手边。面朝南时 +X（东）在左手，验算过。 */
+    private static String sideLabel(Vec3 forward, Vec3 dir) {
+        double cross = forward.x * dir.z - forward.z * dir.x;
+        if (cross < -0.08) return "偏左";
+        if (cross > 0.08) return "偏右";
+        return "正前方";
+    }
+
+    private static JsonObject blockAt(ServerLevel level, BlockPos pos) {
+        JsonObject out = new JsonObject();
+        if (!level.isLoaded(pos)) {
+            out.addProperty("block", "");
+            return out;
+        }
+        out.add("pos", blockPos(pos));
+        out.addProperty("block", blockId(level, pos));
+        return out;
+    }
+
+    private static JsonArray vec(Vec3 value) {
+        JsonArray out = new JsonArray();
+        out.add(round(value.x));
+        out.add(round(value.y));
+        out.add(round(value.z));
         return out;
     }
 
@@ -185,6 +466,7 @@ public final class WabSensors {
         JsonArray ores = new JsonArray();
         JsonArray containers = new JsonArray();
         JsonArray crops = new JsonArray();
+        JsonArray beds = new JsonArray();
         BlockPos origin = maid.blockPosition();
         List<FoundBlock> found = new ArrayList<>();
         for (BlockPos pos : BlockPos.betweenClosed(
@@ -195,9 +477,10 @@ public final class WabSensors {
             boolean ore = isOre(state);
             boolean container = state.hasBlockEntity() && level.getBlockEntity(pos) instanceof Container;
             boolean crop = isMatureCrop(state);
-            if (!ore && !container && !crop) continue;
+            boolean bed = isBedLike(state) && state.hasProperty(PART) && state.getValue(PART) == BedPart.HEAD;
+            if (!ore && !container && !crop && !bed) continue;
             found.add(new FoundBlock(pos.immutable(), maid.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5),
-                    ore, container, crop));
+                    ore, container, crop, bed));
         }
         found.sort(Comparator.comparingDouble(FoundBlock::distance));
         for (FoundBlock block : found) {
@@ -216,10 +499,20 @@ public final class WabSensors {
                 item.addProperty("block", blockId(level, block.pos));
                 crops.add(item);
             }
+            // 床单独一档：她要在「睡自己的床 / 睡主人的床 / 直接躺地上」之间做决定，得先看得见选项。
+            if (block.bed && beds.size() < 12) {
+                JsonObject item = blockJson(block.pos, maid);
+                BlockState state = level.getBlockState(block.pos);
+                item.addProperty("block", blockId(level, block.pos));
+                item.addProperty("for", isMaidBed(state) ? "maid" : "vanilla");
+                item.addProperty("occupied", state.getValue(OCCUPIED));
+                beds.add(item);
+            }
         }
         out.add("ores", ores);
         out.add("containers", containers);
         out.add("crops", crops);
+        out.add("beds", beds);
         return out;
     }
 
@@ -234,7 +527,7 @@ public final class WabSensors {
             if (!state.getFluidState().isSource()) continue;
             if (!state.getFluidState().is(FluidTags.WATER) && !state.getFluidState().is(FluidTags.LAVA)) continue;
             found.add(new FoundBlock(pos.immutable(),
-                    maid.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5), false, false, false));
+                    maid.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5), false, false, false, false));
         }
         found.sort(Comparator.comparingDouble(FoundBlock::distance));
         for (FoundBlock block : found) {
@@ -382,10 +675,33 @@ public final class WabSensors {
     }
 
     public static String kind(Entity entity) {
+        // 另一只女仆既不是 player 也不是 animal：不单独分出来，AI 眼里她就是一团「别的活物」。
+        if (entity instanceof EntityMaid) return "maid";
         if (entity instanceof Player) return "player";
         if (entity instanceof Monster) return "hostile";
         if (entity instanceof Animal) return "animal";
         return "other";
+    }
+
+    /** 床：原版床、别的模组装进 minecraft:beds 标签的床，和女仆自己的床，都算。 */
+    public static boolean isBedLike(BlockState state) {
+        return state.is(BlockTags.BEDS) || isMaidBed(state);
+    }
+
+    public static boolean isMaidBed(BlockState state) {
+        return state.is(InitBlocks.MAID_BED.get());
+    }
+
+    /**
+     * 躺下统一躺床头那一格：方块实体、颜色和 MaidBedTask 查的 OCCUPIED 都挂在头上，
+     * 睡到脚那格会让她渲染在床尾，也让「这张床有没有人」的判断对不上。
+     * AI 给的坐标、日程里的睡位都可能是任一半，所以过一遍再躺。
+     */
+    public static BlockPos bedHead(BlockGetter level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+        if (!state.hasProperty(PART)) return pos;
+        return state.getValue(PART) == BedPart.HEAD ? pos
+                : pos.relative(state.getValue(BlockStateProperties.HORIZONTAL_FACING));
     }
 
     public static boolean isOre(BlockState state) {
@@ -450,6 +766,6 @@ public final class WabSensors {
         return Math.round(value * 10.0) / 10.0;
     }
 
-    private record FoundBlock(BlockPos pos, double distance, boolean ore, boolean container, boolean crop) {
+    private record FoundBlock(BlockPos pos, double distance, boolean ore, boolean container, boolean crop, boolean bed) {
     }
 }

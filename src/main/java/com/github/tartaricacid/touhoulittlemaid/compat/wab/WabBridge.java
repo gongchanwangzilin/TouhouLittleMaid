@@ -1,10 +1,14 @@
 package com.github.tartaricacid.touhoulittlemaid.compat.wab;
 
 import com.github.tartaricacid.touhoulittlemaid.TouhouLittleMaid;
+import com.github.tartaricacid.touhoulittlemaid.api.event.MaidAndItemTransformEvent;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import com.github.tartaricacid.touhoulittlemaid.network.NetworkHandler;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import net.minecraft.ChatFormatting;
+import net.minecraft.SharedConstants;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -28,6 +32,7 @@ import net.minecraftforge.fml.common.Mod;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -66,10 +71,36 @@ public final class WabBridge {
     private volatile JsonArray beaconMaids = new JsonArray();
     private volatile boolean allowWorldActions = true;
     private volatile boolean allowGestures = true;
+    /** 死过的女仆：她的 UUID → 死时候的名字和时间。复活在原版里没有事件，只能自己认，见 onMaidTransform 与 noteReappear。 */
+    private final Map<UUID, Mourned> mourned = new ConcurrentHashMap<>();
+    /** 从胶片里爬出来的是全新实体（UUID 整个换掉）：ToMaid 事件先把「这个新 UUID 是谁回来了」钉住。 */
+    private final Map<UUID, Mourned> reviving = new ConcurrentHashMap<>();
+    /** 认尸不认太久：过窗的死亡不再等复活，免得撞上之后新收的女仆。 */
+    private static final long MOURN_WINDOW_MS = 20 * 60 * 1000L;
+    /** 上一对女仆互相搭话的时间，键是两个 UUID 排序后拼起来的串。 */
+    private final Map<String, Long> pairChats = new ConcurrentHashMap<>();
+    /** 一对女仆这一轮已经你来我往了几句。冷场过冷却就归零。 */
+    private final Map<String, Integer> pairHops = new ConcurrentHashMap<>();
+    private static final int MAX_PAIR_HOPS = 4;
+    /** 发出去的拍照请求：requestId → 女仆 + 发出时间，超时也要给 WAB 一个交代。 */
+    private final Map<Integer, PendingPhoto> pendingPhotos = new ConcurrentHashMap<>();
+    private int photoSequence = 1;
+
+    /** 一张照片最多多少字节。超了就明说「拍不下来」，不能拿 4MB 的行上限当许可。 */
+    private static final int MAX_PHOTO_BYTES = 1_200_000;
+    private static final long PHOTO_TIMEOUT_MS = 8000;
+
+    private record PendingPhoto(UUID maid, long sentAt) {
+    }
+
+    /** 一条「等她回来」的记录：原来叫什么、什么时候记的、死那个的 UUID 是哪个。 */
+    private record Mourned(String name, long at, UUID deadId) {
+    }
 
     private int tickCounter;
     private long lastStateAt;
     private String lastStateHash = "";
+    private boolean ownerWasSleeping;
 
     private WabBridge(MinecraftServer server) {
         this.server = server;
@@ -332,6 +363,9 @@ public final class WabBridge {
         dispatcher.tick();
         tickFollow();
         autonomy.tick();
+        tickPhotos();
+        if (tickCounter % 200 == 0) tickPairChat();
+        if (tickCounter % 10 == 0) tickOwnerSleep();
 
         if (tickCounter % 40 == 0) {
             updateBeaconMaids();
@@ -395,6 +429,8 @@ public final class WabBridge {
                 fresh.put(maid.getUUID(), maid);
             }
         }
+        // 先比对再换名册：清完再问「上一版里有她吗」永远是否，复活会被认成 every chunk reload。
+        noteReappear(new HashMap<>(maids), fresh);
         maids.clear();
         maids.putAll(fresh);
     }
@@ -429,8 +465,10 @@ public final class WabBridge {
         out.addProperty("nonce", nonce);
         out.addProperty("instance", instanceId);
         out.addProperty("mod", TouhouLittleMaid.MOD_ID);
-        out.addProperty("modVersion", modVersion());
-        out.addProperty("mc", "1.20.1");
+        out.addProperty("modVersion", modVersion(TouhouLittleMaid.MOD_ID));
+        out.addProperty("mc", SharedConstants.getCurrentVersion().getName());
+        out.addProperty("loader", loaderName());
+        out.addProperty("loaderVersion", loaderVersion());
         return out;
     }
 
@@ -444,13 +482,45 @@ public final class WabBridge {
         return out.toString();
     }
 
-    private static String modVersion() {
+    private static String modVersion(String modId) {
         try {
-            return ModList.get().getModContainerById(TouhouLittleMaid.MOD_ID)
+            return ModList.get().getModContainerById(modId)
                     .map(container -> container.getModInfo().getVersion().toString())
                     .orElse("");
         } catch (Exception e) {
             return "";
+        }
+    }
+
+    /**
+     * 加载器靠类探测报，不硬写 "forge"：这条分支将来要往 NeoForge 上搬（上游 1.21.1 就是 NeoForge），
+     * 到时候报错了环境比不报更糟。先认 net.neoforged 的包名——NeoForge 早期版本连
+     * net.minecraftforge.* 的类一起带着，只查那边会把它误报成 Forge。
+     */
+    private static String loaderName() {
+        if (hasClass("net.neoforged.fml.ModList") || hasClass("net.neoforged.neoforge.common.NeoForge")) {
+            return "neoforge";
+        }
+        if (hasClass("net.minecraftforge.fml.ModList") || hasClass("net.minecraftforge.common.ForgeMod")) {
+            return "forge";
+        }
+        return "unknown";
+    }
+
+    private static String loaderVersion() {
+        for (String id : new String[]{"neoforge", "forge"}) {
+            String version = modVersion(id);
+            if (!version.isEmpty()) return version;
+        }
+        return "";
+    }
+
+    private static boolean hasClass(String name) {
+        try {
+            Class.forName(name, false, WabBridge.class.getClassLoader());
+            return true;
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
@@ -489,6 +559,12 @@ public final class WabBridge {
 
     public void sendEvent(String kind, EntityMaid maid, String text, double importance,
                           int affectionDelta, String reason) {
+        sendEvent(kind, maid, text, importance, affectionDelta, reason, null);
+    }
+
+    /** extra 是这一类事件独有的字段（主人睡在哪、谁跟她搭的话），WAB 那边按 kind 取用。 */
+    public void sendEvent(String kind, EntityMaid maid, String text, double importance,
+                          int affectionDelta, String reason, JsonObject extra) {
         WabSession current = session;
         if (current == null || current.isClosed()) return;
         JsonObject ev = new JsonObject();
@@ -501,6 +577,9 @@ public final class WabBridge {
         if (affectionDelta != 0) {
             ev.addProperty("affection_delta", affectionDelta);
             ev.addProperty("reason", reason == null ? text : reason);
+        }
+        if (extra != null) {
+            for (String key : extra.keySet()) ev.add(key, extra.get(key));
         }
         ev.add("snapshot", WabSensors.snapshot(this, maid));
         current.send(ev);
@@ -516,6 +595,206 @@ public final class WabBridge {
         chat.addProperty("name", cleanName(maid));
         chat.addProperty("text", text);
         current.send(chat);
+    }
+
+    /**
+     * 请主人的客户端拍一张当前画面。取到之后走 {@link #onPhoto} 单独回一帧，
+     * 所以这里立刻返回一个请求号，让调用方先拿到「她看到了什么」的文字。
+     * 画面只能从正在渲染这个世界的那个客户端取，专用服务器上没有帧缓冲，直接说清楚。
+     */
+    public int requestPhoto(EntityMaid maid, int width) {
+        WabSession current = session;
+        ServerPlayer player = currentOwner();
+        if (current == null || current.isClosed() || player == null) return -1;
+        // 一次只挂一张：截屏要走渲染线程，连着要几张会把客户端的帧排成一串。
+        if (!pendingPhotos.isEmpty()) return -1;
+        int request = photoSequence++;
+        pendingPhotos.put(request, new PendingPhoto(maid.getUUID(), System.currentTimeMillis()));
+        try {
+            NetworkHandler.sendToClientPlayer(new WabPhotoRequest(request, width), player);
+        } catch (Exception e) {
+            pendingPhotos.remove(request);
+            TouhouLittleMaid.LOGGER.warn("[WAB] photo request failed: {}", e.toString());
+            return -1;
+        }
+        return request;
+    }
+
+    /** 客户端把画面送回服务器（也可能带着一句「拍不了」）。 */
+    public void onPhoto(int request, byte[] png, int width, int height, String error) {
+        PendingPhoto pending = pendingPhotos.remove(request);
+        if (pending == null) return;
+        WabSession current = session;
+        if (current == null || current.isClosed()) return;
+        JsonObject frame = new JsonObject();
+        frame.addProperty("v", Integer.parseInt(PROTOCOL));
+        frame.addProperty("type", "photo");
+        frame.addProperty("request", request);
+        frame.addProperty("maid", pending.maid().toString());
+        boolean bad = error != null && !error.isEmpty();
+        if (!bad && (png == null || png.length == 0)) {
+            error = "客户端说拍到了，可一个字节也没交回来。";
+            bad = true;
+        }
+        if (!bad && png.length > MAX_PHOTO_BYTES) {
+            error = "这张画面压完还有 " + (png.length / 1024) + " KB，太大，没往桥上发。";
+            bad = true;
+        }
+        if (bad) {
+            frame.addProperty("ok", false);
+            frame.addProperty("error", error == null ? "客户端没能拍到画面。" : error);
+        } else {
+            frame.addProperty("ok", true);
+            frame.addProperty("mime", "image/png");
+            frame.addProperty("width", width);
+            frame.addProperty("height", height);
+            frame.addProperty("bytes", png == null ? 0 : png.length);
+            frame.addProperty("png", Base64.getEncoder().encodeToString(png == null ? new byte[0] : png));
+        }
+        current.send(frame);
+    }
+
+    /** 请求发出去了但客户端一直没回（离线、卡住、被别的模组拦住）：也要给 WAB 一个了结，别让它干等。 */
+    private void tickPhotos() {
+        if (pendingPhotos.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        for (Map.Entry<Integer, PendingPhoto> entry : new HashMap<>(pendingPhotos).entrySet()) {
+            if (now - entry.getValue().sentAt() < PHOTO_TIMEOUT_MS) continue;
+            pendingPhotos.remove(entry.getKey());
+            onPhoto(entry.getKey(), null, 0, 0, "等客户端回画面超时了，可能这位主人根本没在看这个游戏。");
+        }
+    }
+
+    /**
+     * 女仆互相搭话：两个自己人凑得很近、又隔着一点距离时，报一次「她们在一起」。
+     * WAB 那边把这件事当成一个思考场景，才有机会让她们真的聊起来。
+     * 每一对都有自己的冷却，不然是每 10 秒朝 AI 打一针。
+     */
+    private void tickPairChat() {
+        if (!connected() || maids.size() < 2) return;
+        List<EntityMaid> alive = new ArrayList<>(maids.values());
+        alive.sort(Comparator.comparing(EntityMaid::getUUID));
+        long now = System.currentTimeMillis();
+        for (int i = 0; i < alive.size(); i++) {
+            for (int j = i + 1; j < alive.size(); j++) {
+                EntityMaid a = alive.get(i);
+                EntityMaid b = alive.get(j);
+                if (a.level() != b.level() || !a.isAlive() || !b.isAlive()) continue;
+                double distance = Math.sqrt(a.distanceToSqr(b));
+                if (distance > 10) continue;
+                String key = pairKey(a, b);
+                Long last = pairChats.get(key);
+                if (last != null && now - last < WabConfig.maidChatCooldownSeconds() * 1000L) continue;
+                pairChats.put(key, now);
+                // 新的一轮从这一句起算，之后 noteMaidSpeech 最多再接 MAX_PAIR_HOPS 句
+                pairHops.put(key, 1);
+                String how = distance <= 3 ? "凑到" + cleanName(b) + "身边，两个人挨着站了一会儿。"
+                        : "和 " + cleanName(b) + " 隔了 " + Math.round(distance) + " 格对上了眼。";
+                sendEvent("maid_chat", a, cleanName(a) + how, 0.3, 0, "同伴之间的事");
+                return;
+            }
+        }
+    }
+
+    /**
+     * 她对着同伴说了句话：把这句话原样报给对方，才有「你来我往」可言——
+     * 不然 tickPairChat 只会让一个人单方面感慨「我们挨着站了一会儿」。
+     * 每一对最多连着聊 MAX_PAIR_HOPS 轮，冷场过冷却后重新计；不然两个 AI 可以从天黑聊到天亮。
+     */
+    public void noteMaidSpeech(EntityMaid speaker, String text) {
+        if (!connected() || text == null || text.isBlank()) return;
+        EntityMaid listener = nearestCompanion(speaker, 8.0);
+        if (listener == null) return;
+        String key = pairKey(speaker, listener);
+        long now = System.currentTimeMillis();
+        long gap = WabConfig.maidChatCooldownSeconds() * 1000L;
+        Long last = pairChats.get(key);
+        int hops = pairHops.getOrDefault(key, 0);
+        if (last == null || now - last > gap) hops = 0;
+        if (hops >= MAX_PAIR_HOPS) return;
+        pairChats.put(key, now);
+        pairHops.put(key, hops + 1);
+        if (pairHops.size() > 64) pairHops.entrySet().removeIf(e -> {
+            Long at = pairChats.get(e.getKey());
+            return at == null || now - at > 4 * gap;
+        });
+        sendEvent("maid_chat", listener,
+                cleanName(speaker) + " 凑过来对" + cleanName(listener) + "说：「" + trimForEvent(text) + "」",
+                0.3, 0, "同伴说的话");
+    }
+
+    private static String pairKey(EntityMaid a, EntityMaid b) {
+        return a.getUUID().compareTo(b.getUUID()) <= 0
+                ? a.getUUID() + "|" + b.getUUID() : b.getUUID() + "|" + a.getUUID();
+    }
+
+    private static String trimForEvent(String text) {
+        String flat = text.replaceAll("\\s+", " ").trim();
+        return flat.length() <= 120 ? flat : flat.substring(0, 120) + "…";
+    }
+
+    private EntityMaid nearestCompanion(EntityMaid speaker, double range) {
+        EntityMaid best = null;
+        double bestDistance = range * range;
+        for (EntityMaid maid : maids.values()) {
+            if (maid == speaker || !maid.isAlive() || !isOwned(maid)) continue;
+            if (maid.level() != speaker.level()) continue;
+            double distance = speaker.distanceToSqr(maid);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = maid;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 她倒了：记下 UUID 和当时的名字。
+     * 复活在原版里根本没有事件，只能靠「她重新出现在世界上」认，见 onMaidTransform 与 noteReappear。
+     */
+    private void noteDeath(EntityMaid maid) {
+        long now = System.currentTimeMillis();
+        mourned.put(maid.getUUID(), new Mourned(cleanName(maid), now, maid.getUUID()));
+        sweepMourned(now);
+    }
+
+    /**
+     * 名册里出现新面孔，按准到不准的三条路依次认她是不是回来了：
+     * 一是 onMaidTransform 钉下的那个新 UUID（胶片复活，一步不靠猜）；
+     * 二是死过的那个 UUID 原样回来（别的模组把她搬回来了）；
+     * 三才退到认名字——这条路会把「新收的同名女仆」也报成复活，只当兜底。
+     */
+    private void noteReappear(Map<UUID, EntityMaid> previous, Map<UUID, EntityMaid> fresh) {
+        if (mourned.isEmpty() && reviving.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        for (Map.Entry<UUID, EntityMaid> entry : fresh.entrySet()) {
+            if (previous.containsKey(entry.getKey())) continue;
+            Mourned back = reviving.remove(entry.getKey());
+            if (back == null) {
+                back = mourned.remove(entry.getKey());
+            }
+            if (back == null) {
+                String name = cleanName(entry.getValue());
+                for (Map.Entry<UUID, Mourned> dead : mourned.entrySet()) {
+                    if (now - dead.getValue().at() > MOURN_WINDOW_MS) continue;
+                    if (!dead.getValue().name().equals(name)) continue;
+                    back = dead.getValue();
+                    mourned.remove(dead.getKey());
+                    break;
+                }
+            }
+            if (back == null) continue;
+            // 认到了就把这条死亡记录整个销掉：不然 20 分钟内新收一只同名女仆，还会被名字兜底再报一次复活
+            mourned.remove(back.deadId());
+            sendEvent("respawn", entry.getValue(), back.name() + " 又站起来了。", 0.75, 0, "她复活了");
+        }
+        sweepMourned(now);
+    }
+
+    private void sweepMourned(long now) {
+        long cutoff = now - MOURN_WINDOW_MS;
+        mourned.entrySet().removeIf(entry -> entry.getValue().at() < cutoff);
+        reviving.entrySet().removeIf(entry -> entry.getValue().at() < cutoff);
     }
 
     private boolean eventCoolDown(EntityMaid maid, long millis) {
@@ -598,12 +877,26 @@ public final class WabBridge {
     @SubscribeEvent
     public static void onInteract(PlayerInteractEvent.EntityInteract event) {
         if (event.getSide() != LogicalSide.SERVER) return;
-        if (!(event.getTarget() instanceof EntityMaid maid)) return;
+        noteInteraction(event.getTarget(), event.getEntity(), event.getItemStack());
+    }
+
+    /**
+     * 带坐标的那次右键：附属模组常挂在这条上（摸头、抱抱、递东西这类自己加的互动）。
+     * 只认 EntityInteract 的话，那些动作根本不会报给 WAB，「玩家对她做的任何事她都会想一次」就漏了。
+     * 两条都对同一次点击触发时由 cooldown 收到一起，不会让她想两遍。
+     */
+    @SubscribeEvent
+    public static void onInteractSpecific(PlayerInteractEvent.EntityInteractSpecific event) {
+        if (event.getSide() != LogicalSide.SERVER) return;
+        noteInteraction(event.getTarget(), event.getEntity(), event.getItemStack());
+    }
+
+    private static void noteInteraction(Entity target, Player player, ItemStack stack) {
+        if (!(target instanceof EntityMaid maid)) return;
         WabBridge bridge = instance;
         if (bridge == null || !bridge.isOwned(maid)) return;
-        if (!(event.getEntity() instanceof ServerPlayer player)) return;
+        if (player == null) return;
         if (!bridge.eventCoolDown(maid, 20000)) return;
-        ItemStack stack = event.getItemStack();
         String what = stack.isEmpty() ? "空着手" : "拿着 " + stack.getHoverName().getString();
         bridge.sendEvent("interaction", maid,
                 player.getName().getString() + " 走近她，" + what + " 和她互动了一下。",
@@ -630,8 +923,65 @@ public final class WabBridge {
         if (!(event.getEntity() instanceof EntityMaid maid)) return;
         WabBridge bridge = instance;
         if (bridge == null || !bridge.isOwned(maid)) return;
+        bridge.noteDeath(maid);
         bridge.sendEvent("death", maid,
                 cleanName(maid) + " 在 Minecraft 里倒下了。",
                 0.95, -2, "她在游戏里死亡");
+    }
+
+    /**
+     * 女仆从物品里被放出来（胶片复活、相机、魂符）：这是唯一准确识别「她回来了」的时机。
+     * 胶片那条路是 new 一个全新实体再把数据读回去的，UUID 整个换掉，只排名册差异就只能认名字，
+     * 而事件带的 data 正是死那个的 saveWithoutId 结果，里面还留着她的 "UUID"——
+     * 拿它对上死亡记录，「新收一只同名女仆」就再也不会被误报成复活。
+     * 此刻实体还没进世界、名字也还没读上，所以只记下「这个新 UUID 是谁回来了」，等名册认到再报。
+     */
+    @SubscribeEvent
+    public static void onMaidTransform(MaidAndItemTransformEvent.ToMaid event) {
+        WabBridge bridge = instance;
+        if (bridge == null || !bridge.connected()) return;
+        EntityMaid fresh = event.getMaid();
+        if (fresh.level().isClientSide) return;
+        CompoundTag data = event.getData();
+        if (data == null || !data.hasUUID("UUID")) return;
+        Mourned dead = bridge.mourned.get(data.getUUID("UUID"));
+        if (dead == null) return;
+        // 死亡记录先留着：这条路认的是「换 UUID」，但有的模组放人出来时走 load()，UUID 原样回来，
+        // 那一条要靠 mourned 本身认。谁先认到谁把记录销掉（见 noteReappear）。
+        bridge.reviving.put(fresh.getUUID(), new Mourned(dead.name(), System.currentTimeMillis(), dead.deadId()));
+    }
+
+    /**
+     * 主人躺下这件事得让她知道——陪睡、爱语都从这个场景起，床的位置也要一起报过去，
+     * 不然她只听说「他睡了」，却不知道要往哪儿走。
+     * 这里不挂 PlayerSleepInBedEvent：那个事件是「睡不成」时用来改判的，睡成了未必会走到它跟前。
+     * 盯 isSleeping 的上升沿才是真的睡下了，而且任何模组加的床都算。
+     */
+    private void tickOwnerSleep() {
+        ServerPlayer player = currentOwner();
+        if (player == null) {
+            ownerWasSleeping = false;
+            return;
+        }
+        boolean now = player.isSleeping();
+        if (!now || ownerWasSleeping) {
+            ownerWasSleeping = now;
+            return;
+        }
+        ownerWasSleeping = true;
+        EntityMaid maid = nearestMaid(player, 64);
+        if (maid == null || !eventCoolDown(maid, 30000)) return;
+        JsonObject extra = new JsonObject();
+        player.getSleepingPos().ifPresent(pos -> {
+            JsonArray bed = new JsonArray();
+            bed.add(pos.getX());
+            bed.add(pos.getY());
+            bed.add(pos.getZ());
+            extra.add("bed", bed);
+            extra.addProperty("bedBlock", WabSensors.blockId((ServerLevel) player.level(), pos));
+        });
+        sendEvent("owner_sleep", maid,
+                player.getName().getString() + " 上床睡了，" + cleanName(maid) + " 就在旁边。",
+                0.6, 0, "主人睡了", extra);
     }
 }

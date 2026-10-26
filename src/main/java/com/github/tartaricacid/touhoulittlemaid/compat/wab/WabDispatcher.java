@@ -41,6 +41,28 @@ public final class WabDispatcher {
             return;
         }
 
+        if (method.equals("see")) {
+            // 她「眼前」有什么：文字先回，照片是客户端那一趟来回，只能随后单独送一帧。
+            EntityMaid watcher = maid == null ? bridge.ownedMaids().stream().findFirst().orElse(null) : maid;
+            if (watcher == null) {
+                from.sendResult(id, false, null, "no_maid", "没有可以观察的女仆。");
+                return;
+            }
+            JsonObject data = WabSensors.see(bridge, watcher, params);
+            if (WabJson.bool(params, "photo", false)) {
+                int width = WabJson.integer(params, "photo_width", 640);
+                int request = bridge.requestPhoto(watcher, width);
+                if (request > 0) {
+                    data.addProperty("photoRequest", request);
+                    data.addProperty("photoNote", "画面正从主人的客户端取，取到后另送一帧 photo。");
+                } else {
+                    data.addProperty("photoError", "这会儿取不到画面：主人不在、客户端没连，或上一张还没回来。");
+                }
+            }
+            from.sendResult(id, true, data, null, null);
+            return;
+        }
+
         if (method.equals("backup")) {
             if (maid == null) {
                 from.sendResult(id, false, null, "maid_not_found", "找不到这个女仆。");

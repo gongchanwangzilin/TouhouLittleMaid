@@ -150,6 +150,17 @@ public final class NetworkHandler {
                 com.github.tartaricacid.touhoulittlemaid.compat.wab.WabAnimationMessage::decode,
                 com.github.tartaricacid.touhoulittlemaid.compat.wab.WabAnimationMessage::handle,
                 Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+        // 拍照是来回两趟：服务器请客户端截，客户端把 PNG 交回服务器。只有 WAB 开口要才会走这条路。
+        CHANNEL.registerMessage(60, com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoRequest.class,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoRequest::encode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoRequest::decode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoRequest::handle,
+                Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+        CHANNEL.registerMessage(61, com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoReply.class,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoReply::encode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoReply::decode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoReply::handle,
+                Optional.of(NetworkDirection.PLAY_TO_SERVER));
     }
 
     public static void sendToClientPlayer(Object message, Player player) {

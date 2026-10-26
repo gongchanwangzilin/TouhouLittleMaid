@@ -14,6 +14,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.player.Player;
 import net.minecraftforge.items.ItemHandlerHelper;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -152,6 +153,30 @@ public final class WabActions {
         return null;
     }
 
+    /**
+     * 「递给谁」的解析：不写就是主人；写了名字或 UUID 就在同维度里找另一只女仆或玩家。
+     * 女仆只在自己的名册里找——不然一张地图上别人家的女仆也能被她塞东西。
+     */
+    private static Entity resolveRecipient(WabBridge bridge, EntityMaid maid, String raw) {
+        String text = raw == null ? "" : raw.trim();
+        if (text.isEmpty()) {
+            ServerPlayer owner = bridge.currentOwner();
+            return owner != null && owner.isAlive() ? owner : null;
+        }
+        for (EntityMaid other : bridge.ownedMaids()) {
+            if (other == maid || !other.isAlive() || other.level() != maid.level()) continue;
+            if (WabBridge.cleanName(other).equalsIgnoreCase(text)
+                    || other.getUUID().toString().equalsIgnoreCase(text)) {
+                return other;
+            }
+        }
+        for (Player player : maid.level().getEntitiesOfClass(Player.class,
+                maid.getBoundingBox().inflate(64), Player::isAlive)) {
+            if (player.getName().getString().equalsIgnoreCase(text)) return player;
+        }
+        return null;
+    }
+
     // ==================== 攻击 ====================
 
     public static JsonObject attack(WabBridge bridge, EntityMaid maid, JsonObject p) {
@@ -228,6 +253,8 @@ public final class WabActions {
                 String text = WabJson.str(p, "text");
                 if (!text.isEmpty() && maid.level() instanceof ServerLevel) {
                     maid.getChatBubbleManager().addLLMChatText(text, -1);
+                    // 旁边站着别的女仆就把这句话递过去，她们才聊得起来；一个人自言自语时什么都不额外发。
+                    bridge.noteMaidSpeech(maid, text);
                 }
                 yield ok(maid, "说：「" + text + "」");
             }
@@ -243,9 +270,10 @@ public final class WabActions {
             case "sleep" -> {
                 BlockPos sleepPos = remotePos(maid, WabJson.arr(p, "pos"), SIGHT_REACH);
                 if (sleepPos == null) sleepPos = maid.getSchedulePos().getSleepPos();
+                // 原来只认 BlockTags.BEDS，于是她自己那张女仆床反而睡不上——床一律按「是不是一张床」判。
                 if (sleepPos != null && maid.level().isLoaded(sleepPos)
-                        && maid.level().getBlockState(sleepPos).is(BlockTags.BEDS)) {
-                    maid.startSleeping(sleepPos);
+                        && WabSensors.isBedLike(maid.level().getBlockState(sleepPos))) {
+                    maid.startSleeping(WabSensors.bedHead(maid.level(), sleepPos));
                     yield ok(maid, "上床睡觉了。");
                 }
                 com.github.tartaricacid.touhoulittlemaid.network.NetworkHandler.sendToNearby(maid,
@@ -321,22 +349,35 @@ public final class WabActions {
         String target = WabJson.str(p, "target");
         return switch (action) {
             case "give" -> {
-                ServerPlayer owner = bridge.currentOwner();
-                if (owner == null) yield fail("no_owner", "主人不在线。");
-                if (owner.level() != maid.level() || owner.distanceToSqr(maid) > 8 * 8) {
-                    if (owner.level() == maid.level()) navigateTo(maid, owner.getX(), owner.getY(), owner.getZ(), 2.0);
-                    yield fail("too_far", "离得有点远，没法递过去。");
+                // 递给谁：不写就是主人。以前只认主人，AI 想让两只女仆换东西、或者把石头塞给路过的同伴，全都得吃一次「no_owner」。
+                String to = WabJson.str(p, "to");
+                Entity recipient = resolveRecipient(bridge, maid, to);
+                if (recipient == null) {
+                    yield fail("no_recipient", to.isEmpty() ? "主人不在线。" : "找不到要递给她的人：" + to);
+                }
+                if (recipient.level() != maid.level() || maid.distanceToSqr(recipient) > 8 * 8) {
+                    if (recipient.level() == maid.level()) {
+                        navigateTo(maid, recipient.getX(), recipient.getY(), recipient.getZ(), 2.0);
+                    }
+                    yield fail("too_far", "离 " + recipient.getName().getString() + " 有点远，没法递过去。");
                 }
                 ItemStack stack = takeFromMaid(maid, item, count);
                 if (stack.isEmpty()) yield fail("not_held", "手上没有要找的东西。");
                 int wanted = stack.getCount();
-                InvWrapper playerInv = new InvWrapper(owner.getInventory());
-                ItemStack remainder = ItemHandlerHelper.insertItemStacked(playerInv, stack, false);
-                // 主人包塞不下时剩下的必须落地，不能留在手里这个临时变量里蒸发掉。
+                IItemHandler into = recipient instanceof ServerPlayer player
+                        ? new InvWrapper(player.getInventory())
+                        : ((EntityMaid) recipient).getAvailableInv(false);
+                ItemStack remainder = ItemHandlerHelper.insertItemStacked(into, stack, false);
+                // 对方包塞不下时剩下的必须落地，不能留在手里这个临时变量里蒸发掉。
                 if (!remainder.isEmpty()) {
-                    maid.level().addFreshEntity(new ItemEntity(maid.level(), maid.getX(), maid.getY(), maid.getZ(), remainder));
+                    recipient.level().addFreshEntity(new ItemEntity(recipient.level(),
+                            recipient.getX(), recipient.getY(), recipient.getZ(), remainder));
                 }
-                yield ok(maid, "递给了 " + owner.getName().getString() + "（" + Math.max(0, wanted - remainder.getCount()) + " 个）。");
+                int handed = Math.max(0, wanted - remainder.getCount());
+                maid.swing(InteractionHand.MAIN_HAND);
+                yield ok(maid, handed > 0
+                        ? "递给了 " + recipient.getName().getString() + "（" + handed + " 个）。"
+                        : recipient.getName().getString() + " 包满了，只能丢在他脚边。");
             }
             case "drop" -> {
                 ItemStack stack = takeFromMaid(maid, item, count);

@@ -16,6 +16,8 @@ public final class WabConfig {
     private static final ForgeConfigSpec.BooleanValue LAN_DISCOVERY;
     private static final ForgeConfigSpec.IntValue BEACON_INTERVAL_SECONDS;
     private static final ForgeConfigSpec.BooleanValue AUTONOMY_ENABLED;
+    private static final ForgeConfigSpec.BooleanValue PLAYER_IN_MAID_BED;
+    private static final ForgeConfigSpec.IntValue MAID_CHAT_COOLDOWN;
 
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
@@ -35,6 +37,10 @@ public final class WabConfig {
                 .define("showHud", true);
         AUTONOMY_ENABLED = builder.comment("Let scheduled and random autonomy run on the mod side.")
                 .define("autonomyEnabled", true);
+        PLAYER_IN_MAID_BED = builder.comment("Let the player sleep in a maid bed. Off by default: this changes what right-clicking a maid bed does, so it is opt-in only.")
+                .define("playerCanSleepInMaidBed", false);
+        MAID_CHAT_COOLDOWN = builder.comment("Minimum seconds between two maids reporting each other to WAB.")
+                .defineInRange("maidChatCooldownSeconds", 90, 10, 3600);
         DEBUG = builder.comment("Log every bridge frame.")
                 .define("debug", false);
         builder.pop();
@@ -91,5 +97,17 @@ public final class WabConfig {
 
     public static int beaconIntervalSeconds() {
         return integer(BEACON_INTERVAL_SECONDS, 3);
+    }
+
+    /**
+     * 玩家能不能睡女仆的床。默认关：开了之后右键女仆床的行为就变了，
+     * 而「换上我们的 jar、不连 WAB 也和原版一样」这条不变量得靠这个开关守住。
+     */
+    public static boolean playerCanSleepInMaidBed() {
+        return bool(PLAYER_IN_MAID_BED, false);
+    }
+
+    public static int maidChatCooldownSeconds() {
+        return integer(MAID_CHAT_COOLDOWN, 90);
     }
 }
