@@ -1,8 +1,12 @@
 package com.github.tartaricacid.touhoulittlemaid.network;
 
 import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabAnimationMessage;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabBindingSync;
 import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoReply;
 import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoRequest;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceAudio;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceClip;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceText;
 import com.github.tartaricacid.touhoulittlemaid.network.message.*;
 import com.github.tartaricacid.touhoulittlemaid.network.message.ai.*;
 import net.minecraft.core.BlockPos;
@@ -89,6 +93,13 @@ public class NetworkHandler {
         registrar.playToClient(WabAnimationMessage.TYPE, WabAnimationMessage.STREAM_CODEC, WabAnimationMessage::handle);
         registrar.playToClient(WabPhotoRequest.TYPE, WabPhotoRequest.STREAM_CODEC, WabPhotoRequest::handle);
         registrar.playToServer(WabPhotoReply.TYPE, WabPhotoReply.STREAM_CODEC, WabPhotoReply::handle);
+
+        // 语音四条：绑定名单（服务器→主人客户端）、录音上传（客户端→服务器）、
+        // 听写结果与合成音频（服务器→主人客户端）。老宿主不宣告 voice 时客户端一次都不会走。
+        registrar.playToClient(WabBindingSync.TYPE, WabBindingSync.STREAM_CODEC, WabBindingSync::handle);
+        registrar.playToServer(WabVoiceClip.TYPE, WabVoiceClip.STREAM_CODEC, WabVoiceClip::handle);
+        registrar.playToClient(WabVoiceText.TYPE, WabVoiceText.STREAM_CODEC, WabVoiceText::handle);
+        registrar.playToClient(WabVoiceAudio.TYPE, WabVoiceAudio.STREAM_CODEC, WabVoiceAudio::handle);
     }
 
     public static void sendToClientPlayer(CustomPacketPayload payload, ServerPlayer player) {
