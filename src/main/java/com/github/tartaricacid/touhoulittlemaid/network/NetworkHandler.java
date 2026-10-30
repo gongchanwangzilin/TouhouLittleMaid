@@ -161,6 +161,28 @@ public final class NetworkHandler {
                 com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoReply::decode,
                 com.github.tartaricacid.touhoulittlemaid.compat.wab.WabPhotoReply::handle,
                 Optional.of(NetworkDirection.PLAY_TO_SERVER));
+        // 语音四条：绑定名单（服务器→主人客户端）、录音上传（客户端→服务器）、
+        // 听写结果与合成音频（服务器→主人客户端）。老宿主不宣告 voice 时客户端一次都不会走。
+        CHANNEL.registerMessage(62, com.github.tartaricacid.touhoulittlemaid.compat.wab.WabBindingSync.class,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabBindingSync::encode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabBindingSync::decode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabBindingSync::handle,
+                Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+        CHANNEL.registerMessage(63, com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceClip.class,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceClip::encode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceClip::decode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceClip::handle,
+                Optional.of(NetworkDirection.PLAY_TO_SERVER));
+        CHANNEL.registerMessage(64, com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceText.class,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceText::encode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceText::decode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceText::handle,
+                Optional.of(NetworkDirection.PLAY_TO_CLIENT));
+        CHANNEL.registerMessage(65, com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceAudio.class,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceAudio::encode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceAudio::decode,
+                com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceAudio::handle,
+                Optional.of(NetworkDirection.PLAY_TO_CLIENT));
     }
 
     public static void sendToClientPlayer(Object message, Player player) {

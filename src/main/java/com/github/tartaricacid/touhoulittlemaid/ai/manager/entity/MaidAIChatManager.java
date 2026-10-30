@@ -13,6 +13,7 @@ import com.github.tartaricacid.touhoulittlemaid.ai.service.tts.TTSConfig;
 import com.github.tartaricacid.touhoulittlemaid.ai.service.tts.TTSSite;
 import com.github.tartaricacid.touhoulittlemaid.ai.service.tts.TTSSystemServices;
 import com.github.tartaricacid.touhoulittlemaid.capability.ChatTokensCapabilityProvider;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabBridge;
 import com.github.tartaricacid.touhoulittlemaid.config.subconfig.AIConfig;
 import com.github.tartaricacid.touhoulittlemaid.entity.chatbubble.ChatBubbleManager;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
@@ -54,6 +55,11 @@ public final class MaidAIChatManager extends MaidAIChatData {
         if (!AIConfig.LLM_ENABLED.get()) {
             sender.sendSystemMessage(Component.translatable("ai.touhou_little_maid.chat.disable")
                     .withStyle(ChatFormatting.RED));
+            return;
+        }
+        // 绑了 WAB 角色的女仆只认角色自己绑定的 LLM：这句话交给 WAB，游戏里不再挑站点。
+        WabBridge bridge = WabBridge.get();
+        if (bridge != null && bridge.sendChatIfBound(this.maid, message)) {
             return;
         }
         sender.getCapability(ChatTokensCapabilityProvider.CHAT_TOKENS_CAP).ifPresent(chatTokens -> {

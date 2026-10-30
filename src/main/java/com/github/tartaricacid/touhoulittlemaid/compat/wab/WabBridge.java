@@ -54,7 +54,7 @@ public final class WabBridge {
      * 否则宿主拿到的是「车万女仆的版本」，永远看不出用户装的桥是上个月那一份还是今天这一份。
      * 加协议无关的新字段、新事件时 +0.1；改线上帧的语义才动 PROTOCOL。
      */
-    private static final String BRIDGE_BUILD = "1.4.0";
+    private static final String BRIDGE_BUILD = "1.5.0";
     private static final String MAGIC = "WAB-MAID";
     private static WabBridge instance;
 
@@ -77,6 +77,11 @@ public final class WabBridge {
     private volatile JsonArray beaconMaids = new JsonArray();
     private volatile boolean allowWorldActions = true;
     private volatile boolean allowGestures = true;
+    /** 宿主在 welcome 里宣告的语音能力；断线就归零，模组立刻回到自己的 TTS/STT。 */
+    private volatile boolean voiceTts;
+    private volatile boolean voiceStt;
+    /** 交给 WAB 作答的聊天：女仆 UUID → 那句「思考中」气泡的 id，回话后换成正文，失败就撤掉。 */
+    private final Map<UUID, Long> pendingReplies = new ConcurrentHashMap<>();
     /** 死过的女仆：她的 UUID → 死时候的名字和时间。复活在原版里没有事件，只能自己认，见 onMaidTransform 与 noteReappear。 */
     private final Map<UUID, Mourned> mourned = new ConcurrentHashMap<>();
     /** 从胶片里爬出来的是全新实体（UUID 整个换掉）：ToMaid 事件先把「这个新 UUID 是谁回来了」钉住。 */
@@ -158,6 +163,25 @@ public final class WabBridge {
 
     public boolean allowGestures() {
         return allowGestures;
+    }
+
+    /** WAB 现在能不能合成语音；会话断了就当不能，模组立刻回到自己的实现。 */
+    public boolean voiceTts() {
+        return voiceTts && connected();
+    }
+
+    /** WAB 现在能不能听写；会话断了就当不能。 */
+    public boolean voiceStt() {
+        return voiceStt && connected();
+    }
+
+    /** 这具身体是不是绑了 WAB 角色。绑了才继承角色自己的 LLM 与嗓子。 */
+    public boolean isBound(EntityMaid maid) {
+        return maid != null && boundCharacters.containsKey(maid.getUUID());
+    }
+
+    public Collection<UUID> boundMaidIds() {
+        return boundCharacters.keySet();
     }
 
     public WabDispatcher dispatcher() {
@@ -246,6 +270,10 @@ public final class WabBridge {
         // 采集任务会一路挖到 tick 预算用完——「WAB 没跑 = 上游行为」这条就不成立了。
         server.execute(() -> {
             dispatcher.cancelAll("WAB 断开了");
+            voiceTts = false;
+            voiceStt = false;
+            WabVoice.reset(this);
+            clearPendingReplies();
             for (Map.Entry<UUID, UUID> entry : new HashMap<>(followTargets).entrySet()) {
                 EntityMaid maid = maids.get(entry.getKey());
                 if (maid == null) continue;
@@ -264,6 +292,9 @@ public final class WabBridge {
             case "bind" -> onBind(frame);
             case "stats" -> onStats(frame);
             case "chat_reply" -> onChatReply(frame);
+            case "tts_reply" -> WabVoice.onTtsReply(this, frame);
+            case "tts_audio" -> WabVoice.onTtsAudio(this, frame);
+            case "stt_reply" -> WabVoice.onSttReply(this, frame);
             case "command" -> {
                 String id = WabJson.str(frame, "id");
                 String method = WabJson.str(frame, "method").toLowerCase(Locale.ROOT);
@@ -287,6 +318,10 @@ public final class WabBridge {
         JsonObject settings = WabJson.obj(welcome, "settings");
         if (settings.has("allowWorldActions")) allowWorldActions = WabJson.bool(settings, "allowWorldActions", true);
         if (settings.has("allowGestures")) allowGestures = WabJson.bool(settings, "allowGestures", true);
+        // 宿主没宣告 voice 就是老版本：能力按「没有」处理，绑了角色也仍用游戏自己的语音。
+        JsonObject voice = WabJson.obj(welcome, "voice");
+        voiceTts = WabJson.bool(voice, "tts", false);
+        voiceStt = WabJson.bool(voice, "stt", false);
         boundCharacters.clear();
         JsonObject bound = WabJson.obj(welcome, "bound");
         for (String maidId : bound.keySet()) {
@@ -298,6 +333,7 @@ public final class WabBridge {
         TouhouLittleMaid.LOGGER.info("[WAB] handshake ok, save={}, character={}, bound={}",
                 WabJson.str(welcome, "saveId"), WabJson.str(welcome, "characterId"), boundCharacters.size());
         updateBeaconMaids();
+        WabVoice.pushClientState(this);
         sendState(true);
         if (owner != null) {
             owner.displayClientMessage(Component.literal("温暖如初已连接").withStyle(ChatFormatting.GRAY), true);
@@ -316,6 +352,7 @@ public final class WabBridge {
         if (owner != null && WabJson.arr(bind, "notes").size() > 0) {
             owner.displayClientMessage(Component.literal(WabJson.str(bind, "notes")).withStyle(ChatFormatting.GRAY), false);
         }
+        WabVoice.pushClientState(this);
     }
 
     private void onStats(JsonObject frame) {
@@ -330,14 +367,23 @@ public final class WabBridge {
         value.mood = WabJson.integer(frame, "mood", 0);
         value.receivedAt = System.currentTimeMillis();
         stats.put(maidId, value);
-        if (value.character != null && !value.character.isEmpty()) boundCharacters.put(maidId, value.character);
+        boolean boundChanged = false;
+        if (value.character != null && !value.character.isEmpty()) {
+            boundChanged = !value.character.equals(boundCharacters.put(maidId, value.character));
+        }
+        // 角色是在对话里才认上的（auto-bind）时，客户端也要立刻知道这具身体改走 WAB 的语音。
+        if (boundChanged) WabVoice.pushClientState(this);
     }
 
     private void onChatReply(JsonObject frame) {
         String maidId = WabJson.str(frame, "maid");
         String text = WabJson.str(frame, "text");
         EntityMaid maid = resolveMaid(maidId);
+        UUID maidUuid = maid == null ? uuid(maidId) : maid.getUUID();
+        Long waiting = maidUuid == null ? null : pendingReplies.remove(maidUuid);
+        long bubble = waiting == null ? -1 : waiting;
         if (!WabJson.bool(frame, "ok", true)) {
+            if (maid != null && bubble >= 0) maid.getChatBubbleManager().removeChatBubble(bubble);
             String error = WabJson.str(frame, "error", "她没能回应。");
             ServerPlayer player = currentOwner();
             if (player != null) player.sendSystemMessage(Component.literal(error).withStyle(ChatFormatting.GRAY));
@@ -345,7 +391,9 @@ public final class WabBridge {
         }
         if (text.isEmpty()) return;
         if (maid != null && maid.level() instanceof ServerLevel) {
-            maid.getChatBubbleManager().addLLMChatText(text, -1);
+            maid.getChatBubbleManager().addLLMChatText(text, bubble);
+            // 绑了 WAB 角色的女仆，这句话也用角色自己的嗓子念出来；音色由宿主按角色决定。
+            WabVoice.speak(this, maid, text);
         } else {
             ServerPlayer player = currentOwner();
             if (player != null) {
@@ -370,6 +418,7 @@ public final class WabBridge {
         tickFollow();
         autonomy.tick();
         tickPhotos();
+        WabVoice.tick(this);
         if (tickCounter % 200 == 0) tickPairChat();
         if (tickCounter % 10 == 0) tickOwnerSleep();
 
@@ -602,6 +651,30 @@ public final class WabBridge {
         chat.addProperty("name", cleanName(maid));
         chat.addProperty("text", text);
         current.send(chat);
+    }
+
+    /**
+     * 绑了 WAB 角色的女仆：这句话由 WAB 那边的人来答，游戏里不再调自己的 LLM。
+     * 返回 false 表示这具身体不归 WAB 管（或桥没连），调用方照旧走游戏自己的站点。
+     */
+    public boolean sendChatIfBound(EntityMaid maid, String text) {
+        WabSession current = session;
+        if (current == null || current.isClosed()) return false;
+        if (!isOwned(maid) || !isBound(maid)) return false;
+        if (text == null || text.isBlank()) return false;
+        // 与上游同一条「正在思考」气泡：WAB 回话后换成正文，失败就撤掉。
+        long bubble = maid.getChatBubbleManager().addThinkingText("ai.touhou_little_maid.chat.chat_bubble_waiting");
+        pendingReplies.put(maid.getUUID(), bubble);
+        sendChat(maid, text);
+        return true;
+    }
+
+    private void clearPendingReplies() {
+        for (Map.Entry<UUID, Long> entry : new HashMap<>(pendingReplies).entrySet()) {
+            EntityMaid maid = maids.get(entry.getKey());
+            if (maid != null && maid.isAlive()) maid.getChatBubbleManager().removeChatBubble(entry.getValue());
+        }
+        pendingReplies.clear();
     }
 
     /**

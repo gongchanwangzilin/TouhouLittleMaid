@@ -4,6 +4,8 @@ import com.github.tartaricacid.touhoulittlemaid.ai.manager.entity.STTCallback;
 import com.github.tartaricacid.touhoulittlemaid.ai.manager.site.AvailableSites;
 import com.github.tartaricacid.touhoulittlemaid.ai.service.stt.STTConfig;
 import com.github.tartaricacid.touhoulittlemaid.ai.service.stt.STTSite;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabClientState;
+import com.github.tartaricacid.touhoulittlemaid.compat.wab.WabVoiceClient;
 import com.github.tartaricacid.touhoulittlemaid.config.subconfig.AIConfig;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
 import com.github.tartaricacid.touhoulittlemaid.init.InitSounds;
@@ -110,6 +112,11 @@ public class STTChatKey {
         if (player == null) {
             return;
         }
+        // 绑了 WAB 角色的女仆：录音仍走这台机器的麦克风，听写交给 WAB（经服务器转发）。
+        if (WabClientState.sttFor(maid)) {
+            WabVoiceClient.start(maid, new STTCallback(player, maid));
+            return;
+        }
         STTSite sttSite = AvailableSites.getSTTSite(AIConfig.STT_TYPE.get().getName());
         if (!sttSite.enabled()) {
             player.sendSystemMessage(Component.translatable("ai.touhou_little_maid.chat.stt.empty"));
@@ -125,6 +132,10 @@ public class STTChatKey {
     }
 
     private static void sttStop(EntityMaid maid) {
+        if (WabVoiceClient.isRecordingFor(maid)) {
+            WabVoiceClient.stop();
+            return;
+        }
         LocalPlayer player = Minecraft.getInstance().player;
         if (player == null) {
             return;
